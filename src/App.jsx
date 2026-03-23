@@ -151,95 +151,80 @@ function makeComment(diff, valA, valB, status) {
   return "Value mismatch";
 }
 
-// ─── Excel Export — single workbook, 3 sheets matching reference ──────────────
+// ─── Excel Export — CSV downloads (SheetJS crashes on 300k+ rows) ────────────
 async function exportToExcel(sessions, allMappings) {
-  const { utils, writeFile } = await import("https://cdn.sheetjs.com/xlsx-0.20.1/package/xlsx.mjs");
-
-  // Gather column layout from first session
   const s0 = sessions[0];
-  const keyMaps0 = s0.mappings.filter(m => m.isKey && m.colA && m.colB);
   const cMaps0 = s0.mappings.filter(m => m.compare && !m.isKey && m.colA && m.colB);
   const firstRowA = s0.results.find(r => r.rowA)?.rowA || {};
   const allColsA = Object.keys(firstRowA);
   const compareColsSet = new Set(cMaps0.map(m => m.colA));
-  const sharedCols = allColsA.filter(c => !compareColsSet.has(c));
+  const diffNonCompareCols = allColsA.filter(c => !compareColsSet.has(c));
+  const diffExtraCols = cMaps0.flatMap(m => [m.colA, `${m.colB} (USOPTE)`, "Difference", "SK Comment"]);
 
-  // ── SHEET 1: Comparison Results ──
-  // Columns: Status | Source | Composite Key | <sharedCols> | Current | Year-to-Date | … (all colA cols)
-  // Each record = 2 rows (File A then File B), alternating, all sessions appended
+  const toCSV = (rows) => rows.map(row =>
+    row.map(v => {
+      const s = v == null ? "" : String(v);
+      return s.includes(",") || s.includes('"') || s.includes("\n") ? `"${s.replace(/"/g, '""')}"` : s;
+    }).join(",")
+  ).join("\n");
+
+  const downloadCSV = (content, filename) => {
+    const blob = new Blob(["\uFEFF" + content], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = filename; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  // ── Sheet 1: Comparison Results ──
   const compCols = ["Status", "Source", "Composite Key", ...allColsA];
   const compRows = [compCols];
-
-  // Track which col indices are compare cols (for reference only)
-  const compareColsA = allColsA.filter(c => compareColsSet.has(c));
-
   for (const s of sessions) {
     const kMaps = s.mappings.filter(m => m.isKey && m.colA && m.colB);
+    const bMap = Object.fromEntries(s.mappings.filter(m => m.colA && m.colB).map(m => [m.colA, m.colB]));
     for (const r of s.results) {
-      const compositeKey = kMaps.map(m => r.keyVals[m.colA] ?? "").join("|");
-      // Row A
-      const rowA = [r.status, s.fileAName, compositeKey, ...allColsA.map(c => r.rowA ? (r.rowA[c] ?? "") : "")];
-      // Row B — map colB values back to colA column positions
-      const bMap = Object.fromEntries(s.mappings.filter(m => m.colA && m.colB).map(m => [m.colA, m.colB]));
-      const rowB = [r.status, s.fileBName, compositeKey, ...allColsA.map(c => { const colB = bMap[c]; return r.rowB && colB ? (r.rowB[colB] ?? "") : ""; })];
-      compRows.push(rowA);
-      compRows.push(rowB);
+      const key = kMaps.map(m => r.keyVals[m.colA] ?? "").join("|");
+      compRows.push([r.status, s.fileAName, key, ...allColsA.map(c => r.rowA ? (r.rowA[c] ?? "") : "")]);
+      compRows.push([r.status, s.fileBName, key, ...allColsA.map(c => { const cb = bMap[c]; return r.rowB && cb ? (r.rowB[cb] ?? "") : ""; })]);
     }
   }
 
-  // ── SHEET 2: Difference Mismatch ──
-  // Columns: Status | Source | Composite Key | <sharedCols> | Current | Current USOPTE | Difference | SK Comment | rest of cols
-  // 1 row per mismatched record (not paired), File B row (USOPTE = source of truth)
-  const diffExtraCols = cMaps0.flatMap(m => [m.colA, `${m.colB} (USOPTE)`, "Difference", "SK Comment"]);
-  const diffNonCompareCols = allColsA.filter(c => !compareColsSet.has(c));
+  // ── Sheet 2: Difference Mismatch ──
   const diffCols = ["Status", "Source", "Composite Key", ...diffNonCompareCols, ...diffExtraCols];
   const diffRows = [diffCols];
-
   for (const s of sessions) {
     const kMaps = s.mappings.filter(m => m.isKey && m.colA && m.colB);
     const sCmaps = s.mappings.filter(m => m.compare && !m.isKey && m.colA && m.colB);
     const bMapFull = Object.fromEntries(s.mappings.filter(m => m.colA && m.colB).map(m => [m.colA, m.colB]));
     for (const r of s.results.filter(r => r.status !== "Matched")) {
-      const compositeKey = kMaps.map(m => r.keyVals[m.colA] ?? "").join("|");
-      const sharedVals = diffNonCompareCols.map(c => { const colB = bMapFull[c]; return r.rowB && colB ? (r.rowB[colB] ?? "") : (r.rowA ? (r.rowA[c] ?? "") : ""); });
+      const key = kMaps.map(m => r.keyVals[m.colA] ?? "").join("|");
+      const sharedVals = diffNonCompareCols.map(c => { const cb = bMapFull[c]; return r.rowB && cb ? (r.rowB[cb] ?? "") : (r.rowA ? (r.rowA[c] ?? "") : ""); });
       const compareVals = cMaps0.flatMap(m => {
-        const sCm = sCmaps.find(x => x.colA === m.colA);
-        const valA = sCm && r.rowB ? (r.rowB[sCm.colB] ?? "") : ""; // USOPTE = File B
-        const valB = sCm && r.rowA ? (r.rowA[sCm.colA] ?? "") : ""; // File A = Current
+        const sc = sCmaps.find(x => x.colA === m.colA);
+        const valA = sc && r.rowA ? (r.rowA[sc.colA] ?? "") : "";
+        const valB = sc && r.rowB ? (r.rowB[sc.colB] ?? "") : "";
         const d = r.details?.find(d => d.colA === m.colA);
         const diff = d?.diff || "";
-        const comment = makeComment(diff, valB, valA, r.status);
-        return [valB, valA, diff ? parseFloat(diff) || diff : "", comment];
+        return [valA, valB, diff ? (parseFloat(diff) || diff) : "", makeComment(diff, valA, valB, r.status)];
       });
-      diffRows.push([r.status, s.fileBName, compositeKey, ...sharedVals, ...compareVals]);
+      diffRows.push([r.status, s.fileBName, key, ...sharedVals, ...compareVals]);
     }
   }
 
-  // ── SHEET 3: Summary ──
-  const summaryData = [
+  // ── Sheet 3: Summary ──
+  const summaryRows = [
     ["CompareIQ — Comparison Summary"],
     [],
     ["Session #", "File A", "File B", "Total A", "Total B", "Matched", "Mismatched", "Only in A", "Only in B", "Duplicates", "Match Rate"],
     ...sessions.map((s, i) => [i + 1, s.fileAName, s.fileBName, s.totalA, s.totalB, s.matched, s.mismatched, s.onlyA, s.onlyB, s.duplicates, `${((s.matched / (s.matched + s.mismatched || 1)) * 100).toFixed(1)}%`])
   ];
 
-  // aoa_to_sheet crashes on 300k+ rows (RangeError: Too many properties).
-  // sheet_add_aoa in chunks avoids the single huge object allocation.
-  const makeSheet = (rows) => {
-    if (!rows.length) return utils.aoa_to_sheet([[]]);
-    const CHUNK = 10000;
-    const ws = utils.aoa_to_sheet([rows[0]]); // header only
-    for (let i = 1; i < rows.length; i += CHUNK) {
-      utils.sheet_add_aoa(ws, rows.slice(i, i + CHUNK), { origin: -1 });
-    }
-    return ws;
-  };
-
-  const wb = utils.book_new();
-  utils.book_append_sheet(wb, makeSheet(summaryData), "Summary");
-  utils.book_append_sheet(wb, makeSheet(compRows), "Comparison Results");
-  utils.book_append_sheet(wb, makeSheet(diffRows), "Difference Mismatch");
-  writeFile(wb, "CompareIQ_Results.xlsx");
+  // Download all 3 as CSV files
+  downloadCSV(toCSV(summaryRows), "CompareIQ_Summary.csv");
+  await new Promise(r => setTimeout(r, 300));
+  downloadCSV(toCSV(compRows), "CompareIQ_Comparison_Results.csv");
+  await new Promise(r => setTimeout(r, 300));
+  downloadCSV(toCSV(diffRows), "CompareIQ_Difference_Mismatch.csv");
 }
 
 // ─── Styles (LIGHT THEME) ────────────────────────────────────────────────────
@@ -425,7 +410,7 @@ export default function CompareIQ() {
       <div style={{ maxWidth: 1100, margin: "0 auto", padding: "28px 20px" }}>
         {error && <div style={{ background: C.redLight, border: `1px solid ${C.red}33`, color: C.red, borderRadius: 9, padding: "9px 14px", marginBottom: 14, fontSize: 12, display: "flex", justifyContent: "space-between", alignItems: "center" }}>⚠️ {error}<button onClick={() => setError("")} style={{ background: "none", border: "none", color: C.red, cursor: "pointer", fontSize: 16, lineHeight: 1 }}>×</button></div>}
         {loading && <div style={{ background: C.blueLight, border: `1px solid ${C.blue}33`, borderRadius: 9, padding: "9px 14px", marginBottom: 14, fontSize: 12, color: C.blue }}>⏳ Processing…</div>}
-        {exporting && <div style={{ background: C.amberLight, border: `1px solid ${C.amber}33`, borderRadius: 9, padding: "9px 14px", marginBottom: 14, fontSize: 12, color: C.amber, fontWeight: 600 }}>⏳ Building Excel file — this may take a moment for large datasets ({sessions.reduce((a, s) => a + s.results.length, 0).toLocaleString()} records)…</div>}
+        {exporting && <div style={{ background: C.amberLight, border: `1px solid ${C.amber}33`, borderRadius: 9, padding: "9px 14px", marginBottom: 14, fontSize: 12, color: C.amber, fontWeight: 600 }}>⏳ Building CSV files — downloading 3 files (Summary, Comparison Results, Difference Mismatch)…</div>}
 
         {/* ══ STEP 0 — UPLOAD ══ */}
         {step === 0 && (
@@ -610,7 +595,7 @@ export default function CompareIQ() {
               <div style={{ flex: 1 }} />
               <button onClick={handleExport} disabled={exporting}
                 style={{ ...S.btn(false), background: exporting ? C.textLight : C.green, color: "#fff", border: "none", fontWeight: 700, padding: "7px 16px", opacity: exporting ? 0.7 : 1, cursor: exporting ? "wait" : "pointer" }}>
-                {exporting ? "⏳ Exporting…" : `⬇ Export Excel (${sessions.length} session${sessions.length > 1 ? "s" : ""})`}
+                {exporting ? "⏳ Exporting…" : `⬇ Export CSV (${sessions.length} session${sessions.length > 1 ? "s" : ""})`}
               </button>
               <button onClick={() => { setStep(0); setResults(null); }}
                 style={{ ...S.btn(false), color: C.blue, borderColor: C.blue, fontWeight: 700 }}>+ New Comparison</button>
