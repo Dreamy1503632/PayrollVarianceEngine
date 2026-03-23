@@ -170,9 +170,8 @@ async function exportToExcel(sessions, allMappings) {
   const compCols = ["Status", "Source", "Composite Key", ...allColsA];
   const compRows = [compCols];
 
-  // Track which col indices are compare cols (for red highlight)
-  const compareColIdxSet = new Set();
-  allColsA.forEach((c, i) => { if (compareColsSet.has(c)) compareColIdxSet.add(i + 3); }); // +3 for Status,Source,CompositeKey
+  // Track which col indices are compare cols (for reference only)
+  const compareColsA = allColsA.filter(c => compareColsSet.has(c));
 
   for (const s of sessions) {
     const kMaps = s.mappings.filter(m => m.isKey && m.colA && m.colB);
@@ -224,60 +223,23 @@ async function exportToExcel(sessions, allMappings) {
     ...sessions.map((s, i) => [i + 1, s.fileAName, s.fileBName, s.totalA, s.totalB, s.matched, s.mismatched, s.onlyA, s.onlyB, s.duplicates, `${((s.matched / (s.matched + s.mismatched || 1)) * 100).toFixed(1)}%`])
   ];
 
-  // ── Build worksheet — 100% manual, zero aoa_to_sheet calls ──────────────
-  // aoa_to_sheet (and sheet_add_aoa internally) enumerates ALL worksheet
-  // properties at write time → RangeError on 100k+ row sheets.
-  // We write each cell directly as {v, t} — no style objects on data rows.
-  const buildSheet = (rows, redColSet) => {
-    const ws = Object.create(null); // plain null-prototype obj, no inherited props
-    if (!rows.length) { ws["!ref"] = "A1"; return ws; }
-    const nCols = rows[0].length;
-    const nRows = rows.length;
-    const colLetters = [];
-    // Pre-compute column letter strings to avoid encode_cell overhead in inner loop
-    for (let c = 0; c < nCols; c++) {
-      let n = c, s = "";
-      do { s = String.fromCharCode(65 + (n % 26)) + s; n = Math.floor(n / 26) - 1; } while (n >= 0);
-      colLetters.push(s);
+  // aoa_to_sheet crashes on 300k+ rows (RangeError: Too many properties).
+  // sheet_add_aoa in chunks avoids the single huge object allocation.
+  const makeSheet = (rows) => {
+    if (!rows.length) return utils.aoa_to_sheet([[]]);
+    const CHUNK = 10000;
+    const ws = utils.aoa_to_sheet([rows[0]]); // header only
+    for (let i = 1; i < rows.length; i += CHUNK) {
+      utils.sheet_add_aoa(ws, rows.slice(i, i + CHUNK), { origin: -1 });
     }
-    for (let r = 0; r < nRows; r++) {
-      const rowArr = rows[r];
-      const isHeader = r === 0;
-      const rowNum = r + 1; // Excel 1-indexed
-      for (let c = 0; c < nCols; c++) {
-        const raw = rowArr[c];
-        const strRaw = raw == null ? "" : String(raw);
-        const numVal = strRaw !== "" && !isNaN(strRaw) ? Number(strRaw) : null;
-        const cell = numVal !== null ? { v: numVal, t: "n" } : { v: strRaw, t: "s" };
-        if (isHeader) {
-          const isRed = redColSet?.has(c);
-          cell.s = {
-            fill: { patternType: "solid", fgColor: { rgb: isRed ? "C00000" : "1F3864" } },
-            font: { bold: true, color: { rgb: "FFFFFF" }, sz: 9, name: "Arial" },
-            alignment: { horizontal: "center", vertical: "center" },
-          };
-        }
-        ws[colLetters[c] + rowNum] = cell;
-      }
-    }
-    ws["!ref"] = `A1:${colLetters[nCols - 1]}${nRows}`;
-    ws["!cols"] = rows[0].map((h, i) => ({
-      wch: redColSet?.has(i) ? 16 : Math.min(Math.max(String(h ?? "").length + 3, 10), 32),
-    }));
-    ws["!rows"] = [{ hpt: 24 }];
     return ws;
   };
 
-  const diffRedColSet = new Set(
-    Array.from({ length: diffExtraCols.length }, (_, i) => i + 3 + diffNonCompareCols.length)
-  );
-
   const wb = utils.book_new();
-  utils.book_append_sheet(wb, buildSheet(summaryData, null), "Summary");
-  utils.book_append_sheet(wb, buildSheet(compRows, compareColIdxSet), "Comparison Results");
-  utils.book_append_sheet(wb, buildSheet(diffRows, diffRedColSet), "Difference Mismatch");
-  // Use writeFile with no compression for faster large-file output
-  writeFile(wb, "CompareIQ_Results.xlsx", { compression: false });
+  utils.book_append_sheet(wb, makeSheet(summaryData), "Summary");
+  utils.book_append_sheet(wb, makeSheet(compRows), "Comparison Results");
+  utils.book_append_sheet(wb, makeSheet(diffRows), "Difference Mismatch");
+  writeFile(wb, "CompareIQ_Results.xlsx");
 }
 
 // ─── Styles (LIGHT THEME) ────────────────────────────────────────────────────
