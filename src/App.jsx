@@ -224,45 +224,43 @@ async function exportToExcel(sessions, allMappings) {
     ...sessions.map((s, i) => [i + 1, s.fileAName, s.fileBName, s.totalA, s.totalB, s.matched, s.mismatched, s.onlyA, s.onlyB, s.duplicates, `${((s.matched / (s.matched + s.mismatched || 1)) * 100).toFixed(1)}%`])
   ];
 
-  // ── Build worksheet — large-dataset safe ──────────────────────────────────
-  // Key insight: adding a .s style object to every cell in a 166k-row sheet
-  // creates ~6M objects and crashes V8's property enumeration in SheetJS's
-  // write step. Solution: only style the header row. Skip ALL cell styling for
-  // data rows entirely — the file will be plain but will always export.
+  // ── Build worksheet — 100% manual, zero aoa_to_sheet calls ──────────────
+  // aoa_to_sheet (and sheet_add_aoa internally) enumerates ALL worksheet
+  // properties at write time → RangeError on 100k+ row sheets.
+  // We write each cell directly as {v, t} — no style objects on data rows.
   const buildSheet = (rows, redColSet) => {
-    if (!rows.length) return utils.aoa_to_sheet([]);
-    const ws = {};
+    const ws = Object.create(null); // plain null-prototype obj, no inherited props
+    if (!rows.length) { ws["!ref"] = "A1"; return ws; }
     const nCols = rows[0].length;
     const nRows = rows.length;
-
+    const colLetters = [];
+    // Pre-compute column letter strings to avoid encode_cell overhead in inner loop
+    for (let c = 0; c < nCols; c++) {
+      let n = c, s = "";
+      do { s = String.fromCharCode(65 + (n % 26)) + s; n = Math.floor(n / 26) - 1; } while (n >= 0);
+      colLetters.push(s);
+    }
     for (let r = 0; r < nRows; r++) {
       const rowArr = rows[r];
       const isHeader = r === 0;
-
+      const rowNum = r + 1; // Excel 1-indexed
       for (let c = 0; c < nCols; c++) {
-        const addr = utils.encode_cell({ r, c });
         const raw = rowArr[c];
-        // Numeric detection
-        const isNum = raw !== "" && raw !== null && raw !== undefined && !isNaN(Number(raw)) && String(raw).trim() !== "";
-        const cellObj = (isNum && typeof raw !== "boolean")
-          ? { v: Number(raw), t: "n" }
-          : { v: raw ?? "", t: "s" };
-
-        // Only style the header row — zero styles on data rows prevents the crash
+        const strRaw = raw == null ? "" : String(raw);
+        const numVal = strRaw !== "" && !isNaN(strRaw) ? Number(strRaw) : null;
+        const cell = numVal !== null ? { v: numVal, t: "n" } : { v: strRaw, t: "s" };
         if (isHeader) {
           const isRed = redColSet?.has(c);
-          cellObj.s = {
+          cell.s = {
             fill: { patternType: "solid", fgColor: { rgb: isRed ? "C00000" : "1F3864" } },
             font: { bold: true, color: { rgb: "FFFFFF" }, sz: 9, name: "Arial" },
-            alignment: { horizontal: "center", vertical: "center", wrapText: false },
+            alignment: { horizontal: "center", vertical: "center" },
           };
         }
-
-        ws[addr] = cellObj;
+        ws[colLetters[c] + rowNum] = cell;
       }
     }
-
-    ws["!ref"] = utils.encode_range({ s: { r: 0, c: 0 }, e: { r: nRows - 1, c: nCols - 1 } });
+    ws["!ref"] = `A1:${colLetters[nCols - 1]}${nRows}`;
     ws["!cols"] = rows[0].map((h, i) => ({
       wch: redColSet?.has(i) ? 16 : Math.min(Math.max(String(h ?? "").length + 3, 10), 32),
     }));
@@ -278,7 +276,8 @@ async function exportToExcel(sessions, allMappings) {
   utils.book_append_sheet(wb, buildSheet(summaryData, null), "Summary");
   utils.book_append_sheet(wb, buildSheet(compRows, compareColIdxSet), "Comparison Results");
   utils.book_append_sheet(wb, buildSheet(diffRows, diffRedColSet), "Difference Mismatch");
-  writeFile(wb, "CompareIQ_Results.xlsx");
+  // Use writeFile with no compression for faster large-file output
+  writeFile(wb, "CompareIQ_Results.xlsx", { compression: false });
 }
 
 // ─── Styles (LIGHT THEME) ────────────────────────────────────────────────────
