@@ -224,57 +224,60 @@ async function exportToExcel(sessions, allMappings) {
     ...sessions.map((s, i) => [i + 1, s.fileAName, s.fileBName, s.totalA, s.totalB, s.matched, s.mismatched, s.onlyA, s.onlyB, s.duplicates, `${((s.matched / (s.matched + s.mismatched || 1)) * 100).toFixed(1)}%`])
   ];
 
-  // Build sheets with styling
-  const makeStyledSheet = (data, redColSet) => {
-    const ws = utils.aoa_to_sheet(data);
-    const nCols = data[0]?.length || 0;
-    const nRows = data.length;
-    // Style header
-    for (let c = 0; c < nCols; c++) {
-      const cell = utils.encode_cell({ r: 0, c });
-      if (!ws[cell]) continue;
-      ws[cell].s = {
-        fill: { patternType: "solid", fgColor: { rgb: redColSet?.has(c) ? "C00000" : "1F3864" } },
-        font: { bold: true, color: { rgb: "FFFFFF" }, sz: 9, name: "Arial" },
-        alignment: { horizontal: "center", wrapText: true, vertical: "center" },
-        border: { bottom: { style: "thin", color: { rgb: "AAAAAA" } }, right: { style: "thin", color: { rgb: "AAAAAA" } } },
-      };
-    }
-    // Style data rows — alternating pair bands (2 rows per pair)
-    for (let r = 1; r < nRows; r++) {
-      const pairIdx = Math.floor((r - 1) / 2);
-      const isFileA = (r - 1) % 2 === 0;
-      const rowData = data[r];
-      const status = rowData?.[0];
-      const isMismatch = status === "Mismatched" || status === "Only in A" || status === "Only in B";
+  // ── Build worksheet — large-dataset safe ──────────────────────────────────
+  // Key insight: adding a .s style object to every cell in a 166k-row sheet
+  // creates ~6M objects and crashes V8's property enumeration in SheetJS's
+  // write step. Solution: only style the header row. Skip ALL cell styling for
+  // data rows entirely — the file will be plain but will always export.
+  const buildSheet = (rows, redColSet) => {
+    if (!rows.length) return utils.aoa_to_sheet([]);
+    const ws = {};
+    const nCols = rows[0].length;
+    const nRows = rows.length;
+
+    for (let r = 0; r < nRows; r++) {
+      const rowArr = rows[r];
+      const isHeader = r === 0;
+
       for (let c = 0; c < nCols; c++) {
-        const cell = utils.encode_cell({ r, c });
-        if (!ws[cell]) ws[cell] = { v: "", t: "s" };
-        const isRed = redColSet?.has(c);
-        const bandBase = pairIdx % 2 === 0;
-        let bg = isRed
-          ? (isMismatch ? "FFCCCC" : "FFE8E8")
-          : (isFileA ? (bandBase ? "EBF5FB" : "D6EAF8") : (bandBase ? "F4ECF7" : "E8DAEF"));
-        ws[cell].s = {
-          fill: { patternType: "solid", fgColor: { rgb: bg } },
-          font: { sz: 9, name: "Arial", color: { rgb: isRed && isMismatch ? "8B0000" : "222222" }, bold: isRed && isMismatch },
-          border: {
-            bottom: { style: !isFileA ? "medium" : "hair", color: { rgb: !isFileA ? "888888" : "DDDDDD" } },
-            right: { style: "hair", color: { rgb: "CCCCCC" } },
-          },
-          alignment: { wrapText: false, vertical: "center" },
-        };
+        const addr = utils.encode_cell({ r, c });
+        const raw = rowArr[c];
+        // Numeric detection
+        const isNum = raw !== "" && raw !== null && raw !== undefined && !isNaN(Number(raw)) && String(raw).trim() !== "";
+        const cellObj = (isNum && typeof raw !== "boolean")
+          ? { v: Number(raw), t: "n" }
+          : { v: raw ?? "", t: "s" };
+
+        // Only style the header row — zero styles on data rows prevents the crash
+        if (isHeader) {
+          const isRed = redColSet?.has(c);
+          cellObj.s = {
+            fill: { patternType: "solid", fgColor: { rgb: isRed ? "C00000" : "1F3864" } },
+            font: { bold: true, color: { rgb: "FFFFFF" }, sz: 9, name: "Arial" },
+            alignment: { horizontal: "center", vertical: "center", wrapText: false },
+          };
+        }
+
+        ws[addr] = cellObj;
       }
     }
-    ws["!cols"] = (data[0] || []).map((h, i) => ({ wch: redColSet?.has(i) ? 16 : String(h).length > 20 ? 28 : Math.max(String(h).length + 4, 10) }));
-    ws["!rows"] = [{ hpt: 28 }];
+
+    ws["!ref"] = utils.encode_range({ s: { r: 0, c: 0 }, e: { r: nRows - 1, c: nCols - 1 } });
+    ws["!cols"] = rows[0].map((h, i) => ({
+      wch: redColSet?.has(i) ? 16 : Math.min(Math.max(String(h ?? "").length + 3, 10), 32),
+    }));
+    ws["!rows"] = [{ hpt: 24 }];
     return ws;
   };
 
+  const diffRedColSet = new Set(
+    Array.from({ length: diffExtraCols.length }, (_, i) => i + 3 + diffNonCompareCols.length)
+  );
+
   const wb = utils.book_new();
-  utils.book_append_sheet(wb, makeStyledSheet(summaryData, null), "Summary");
-  utils.book_append_sheet(wb, makeStyledSheet(compRows, compareColIdxSet), "Comparison Results");
-  utils.book_append_sheet(wb, makeStyledSheet(diffRows, new Set(diffNonCompareCols.length > 0 ? Array.from({ length: diffExtraCols.length }, (_, i) => i + 3 + diffNonCompareCols.length) : [])), "Difference Mismatch");
+  utils.book_append_sheet(wb, buildSheet(summaryData, null), "Summary");
+  utils.book_append_sheet(wb, buildSheet(compRows, compareColIdxSet), "Comparison Results");
+  utils.book_append_sheet(wb, buildSheet(diffRows, diffRedColSet), "Difference Mismatch");
   writeFile(wb, "CompareIQ_Results.xlsx");
 }
 
@@ -316,11 +319,23 @@ export default function CompareIQ() {
   const [tolerance, setTolerance] = useState("1");
   const [results, setResults] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [error, setError] = useState("");
   const [activeTab, setActiveTab] = useState("dashboard");
   const [filterStatus, setFilterStatus] = useState("All");
   const [searchKey, setSearchKey] = useState("");
   const [sessions, setSessions] = useState([]);
+
+  const handleExport = async () => {
+    setExporting(true);
+    setError("");
+    try {
+      await exportToExcel(sessions, mappings);
+    } catch (e) {
+      setError(`Export failed: ${e.message}`);
+    }
+    setExporting(false);
+  };
 
   const handleFile = async (file, which) => {
     setError(""); setLoading(true);
@@ -449,6 +464,7 @@ export default function CompareIQ() {
       <div style={{ maxWidth: 1100, margin: "0 auto", padding: "28px 20px" }}>
         {error && <div style={{ background: C.redLight, border: `1px solid ${C.red}33`, color: C.red, borderRadius: 9, padding: "9px 14px", marginBottom: 14, fontSize: 12, display: "flex", justifyContent: "space-between", alignItems: "center" }}>⚠️ {error}<button onClick={() => setError("")} style={{ background: "none", border: "none", color: C.red, cursor: "pointer", fontSize: 16, lineHeight: 1 }}>×</button></div>}
         {loading && <div style={{ background: C.blueLight, border: `1px solid ${C.blue}33`, borderRadius: 9, padding: "9px 14px", marginBottom: 14, fontSize: 12, color: C.blue }}>⏳ Processing…</div>}
+        {exporting && <div style={{ background: C.amberLight, border: `1px solid ${C.amber}33`, borderRadius: 9, padding: "9px 14px", marginBottom: 14, fontSize: 12, color: C.amber, fontWeight: 600 }}>⏳ Building Excel file — this may take a moment for large datasets ({sessions.reduce((a, s) => a + s.results.length, 0).toLocaleString()} records)…</div>}
 
         {/* ══ STEP 0 — UPLOAD ══ */}
         {step === 0 && (
@@ -631,9 +647,9 @@ export default function CompareIQ() {
                 <button key={t} onClick={() => setActiveTab(t)} style={S.btn(activeTab === t)}>{label}</button>
               ))}
               <div style={{ flex: 1 }} />
-              <button onClick={() => exportToExcel(sessions, mappings)}
-                style={{ ...S.btn(false), background: C.green, color: "#fff", border: "none", fontWeight: 700, padding: "7px 16px" }}>
-                ⬇ Export Excel ({sessions.length} session{sessions.length > 1 ? "s" : ""})
+              <button onClick={handleExport} disabled={exporting}
+                style={{ ...S.btn(false), background: exporting ? C.textLight : C.green, color: "#fff", border: "none", fontWeight: 700, padding: "7px 16px", opacity: exporting ? 0.7 : 1, cursor: exporting ? "wait" : "pointer" }}>
+                {exporting ? "⏳ Exporting…" : `⬇ Export Excel (${sessions.length} session${sessions.length > 1 ? "s" : ""})`}
               </button>
               <button onClick={() => { setStep(0); setResults(null); }}
                 style={{ ...S.btn(false), color: C.blue, borderColor: C.blue, fontWeight: 700 }}>+ New Comparison</button>
