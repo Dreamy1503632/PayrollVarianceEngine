@@ -151,103 +151,9 @@ function makeComment(diff, valA, valB, status) {
   return "Value mismatch";
 }
 
-// ─── Raw XLSX writer — pure browser, zero external dependencies ──────────────
-// Builds a valid .xlsx (ZIP + XML) entirely in the browser.
-// No SheetJS, no fflate — just a minimal ZIP implementation.
+// ─── Excel Export ────────────────────────────────────────────────────────────
 async function exportToExcel(sessions, allMappings) {
 
-  // ── Minimal ZIP builder (store only, no compression) ──────────────────────
-  function makeZip(files) {
-    // files: array of { name: string, data: Uint8Array }
-    const enc = t => new TextEncoder().encode(t);
-    const u32 = n => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n, true); return b; };
-    const u16 = n => { const b = new Uint8Array(2); new DataView(b.buffer).setUint16(0, n, true); return b; };
-
-    // CRC32 table
-    const crcTable = new Uint32Array(256);
-    for (let i = 0; i < 256; i++) {
-      let c = i;
-      for (let j = 0; j < 8; j++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
-      crcTable[i] = c;
-    }
-    function crc32(data) {
-      let crc = 0xFFFFFFFF;
-      for (let i = 0; i < data.length; i++) crc = crcTable[(crc ^ data[i]) & 0xFF] ^ (crc >>> 8);
-      return (crc ^ 0xFFFFFFFF) >>> 0;
-    }
-
-    const localHeaders = [];
-    const centralDir = [];
-    let offset = 0;
-
-    for (const file of files) {
-      const nameBytes = enc(file.name);
-      const data = file.data;
-      const crc = crc32(data);
-      const size = data.length;
-
-      // Local file header
-      const lh = new Uint8Array([
-        0x50,0x4B,0x03,0x04, // signature
-        20,0,                 // version needed
-        0,0,                  // flags
-        0,0,                  // compression: store
-        0,0,0,0,              // mod time/date
-        ...u32(crc),
-        ...u32(size),
-        ...u32(size),
-        ...u16(nameBytes.length),
-        0,0,                  // extra field length
-        ...nameBytes,
-        ...data,
-      ]);
-
-      // Central directory entry
-      const cd = new Uint8Array([
-        0x50,0x4B,0x01,0x02, // signature
-        20,0,                 // version made by
-        20,0,                 // version needed
-        0,0,                  // flags
-        0,0,                  // compression: store
-        0,0,0,0,              // mod time/date
-        ...u32(crc),
-        ...u32(size),
-        ...u32(size),
-        ...u16(nameBytes.length),
-        0,0,                  // extra
-        0,0,                  // comment
-        0,0,                  // disk start
-        0,0,                  // internal attr
-        0,0,0,0,              // external attr
-        ...u32(offset),
-        ...nameBytes,
-      ]);
-
-      localHeaders.push(lh);
-      centralDir.push(cd);
-      offset += lh.length;
-    }
-
-    const cdSize = centralDir.reduce((s, b) => s + b.length, 0);
-    const eocd = new Uint8Array([
-      0x50,0x4B,0x05,0x06, // signature
-      0,0,0,0,              // disk numbers
-      ...u16(files.length),
-      ...u16(files.length),
-      ...u32(cdSize),
-      ...u32(offset),
-      0,0,                  // comment length
-    ]);
-
-    const parts = [...localHeaders, ...centralDir, eocd];
-    const total = parts.reduce((s, b) => s + b.length, 0);
-    const out = new Uint8Array(total);
-    let pos = 0;
-    for (const p of parts) { out.set(p, pos); pos += p.length; }
-    return out;
-  }
-
-  // ── Data setup ────────────────────────────────────────────────────────────
   const s0 = sessions[0];
   const cMaps0 = s0.mappings.filter(m => m.compare && !m.isKey && m.colA && m.colB);
   const firstRowA = s0.results.find(r => r.rowA)?.rowA || {};
@@ -255,104 +161,156 @@ async function exportToExcel(sessions, allMappings) {
   const compareColsSet = new Set(cMaps0.map(m => m.colA));
   const sharedCols = allColsA.filter(c => !compareColsSet.has(c));
 
-  const compHeader = [
+  // Header: Status | Source | Composite Key | <shared cols> | Current | Current USOPTE | Diff | Comment
+  const header = [
     "Status", "Source", "Composite Key",
     ...sharedCols,
     ...cMaps0.flatMap(m => [m.colA, `${m.colB} (USOPTE)`, "Difference", "SK Comment"]),
   ];
 
+  // Build 2-rows-per-record data, filtered by fn
   const buildRows = (filterFn) => {
-    const rows = [compHeader];
+    const rows = [header];
     for (const s of sessions) {
       const kMaps = s.mappings.filter(m => m.isKey && m.colA && m.colB);
       const sCmaps = s.mappings.filter(m => m.compare && !m.isKey && m.colA && m.colB);
       const bMap = Object.fromEntries(s.mappings.filter(m => m.colA && m.colB).map(m => [m.colA, m.colB]));
-      for (const r of s.results.filter(filterFn || (() => true))) {
+      for (const r of s.results.filter(filterFn)) {
         const key = kMaps.map(m => r.keyVals[m.colA] ?? "").join("|");
+        // Row A: all File A values + compare values filled
         const sharedA = sharedCols.map(c => r.rowA ? (r.rowA[c] ?? "") : "");
-        const compareA = cMaps0.flatMap(m => {
+        const cmpA = cMaps0.flatMap(m => {
           const sc = sCmaps.find(x => x.colA === m.colA);
-          const valA = sc && r.rowA ? (r.rowA[sc.colA] ?? "") : "";
-          const valB = sc && r.rowB ? (r.rowB[sc.colB] ?? "") : "";
+          const vA = sc && r.rowA ? (r.rowA[sc.colA] ?? "") : "";
+          const vB = sc && r.rowB ? (r.rowB[sc.colB] ?? "") : "";
           const d = r.details?.find(d => d.colA === m.colA);
           const rawDiff = d?.diff || "";
           const diff = rawDiff !== "" ? (parseFloat(rawDiff) || rawDiff) : "";
-          const comment = makeComment(rawDiff, valA, valB, r.status);
-          return [valA, valB, diff, comment];
+          return [vA, vB, diff, makeComment(rawDiff, vA, vB, r.status)];
         });
-        rows.push([r.status, s.fileAName, key, ...sharedA, ...compareA]);
-        const sharedB = sharedCols.map(c => { const cb = bMap[c]||c; return r.rowB ? (r.rowB[cb] ?? "") : ""; });
-        rows.push([r.status, s.fileBName, key, ...sharedB, ...cMaps0.flatMap(() => ["","","",""])]);
+        rows.push([r.status, s.fileAName, key, ...sharedA, ...cmpA]);
+        // Row B: all File B values, compare cols blank
+        const sharedB = sharedCols.map(c => { const cb = bMap[c] || c; return r.rowB ? (r.rowB[cb] ?? "") : ""; });
+        rows.push([r.status, s.fileBName, key, ...sharedB, ...cMaps0.flatMap(() => ["", "", "", ""])]);
       }
     }
     return rows;
   };
 
-  // NOTE: Writing ALL 333k matched rows produces a 600MB file the browser cannot handle.
-  // Comparison Results = mismatched + only-in-A + only-in-B (the meaningful rows)
-  // Difference Mismatch = mismatched only (excludes only-in-A/B)
+  // Only export non-matched rows — all matched rows = 600MB+ which browsers cannot handle
   const compRows = buildRows(r => r.status !== "Matched");
   const diffRows = buildRows(r => r.status === "Mismatched");
   const summaryRows = [
     ["CompareIQ — Comparison Summary"], [],
-    ["Note: Comparison Results sheet contains non-matched records only (Mismatched + Only in A/B). Matched records are excluded to keep the file size manageable."], [],
-    ["Session #","File A","File B","Total A","Total B","Matched","Mismatched","Only in A","Only in B","Duplicates","Match Rate"],
-    ...sessions.map((s,i)=>[i+1,s.fileAName,s.fileBName,s.totalA,s.totalB,s.matched,s.mismatched,s.onlyA,s.onlyB,s.duplicates,`${((s.matched/(s.matched+s.mismatched||1))*100).toFixed(1)}%`])
+    ["Note: Matched records excluded from sheets below to keep file size manageable."], [],
+    ["Session #", "File A", "File B", "Total A", "Total B", "Matched", "Mismatched", "Only in A", "Only in B", "Duplicates", "Match Rate"],
+    ...sessions.map((s, i) => [i+1, s.fileAName, s.fileBName, s.totalA, s.totalB, s.matched, s.mismatched, s.onlyA, s.onlyB, s.duplicates, `${((s.matched/(s.matched+s.mismatched||1))*100).toFixed(1)}%`])
   ];
 
-  // ── XML helpers ───────────────────────────────────────────────────────────
-  const esc = s => String(s??"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&apos;");
-  const colName = n => { let s=""; for(;n>=0;n=Math.floor(n/26)-1) s=String.fromCharCode(65+n%26)+s; return s; };
-  const encStr = s => new TextEncoder().encode(s);
+  // ── XML helpers ──
+  const esc = v => String(v ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&apos;");
+  const colName = n => { let s = ""; for (; n >= 0; n = Math.floor(n / 26) - 1) s = String.fromCharCode(65 + n % 26) + s; return s; };
+  const toBytes = s => new TextEncoder().encode(s);
 
-  // Build sheet XML in chunks to avoid giant string allocation
+  // Build sheet XML in 2000-row chunks to avoid large string allocations
   const buildSheetBytes = rows => {
-    const CHUNK = 5000; // rows per chunk
-    const blobs = [];
-    blobs.push(encStr('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>'));
+    const chunks = [toBytes('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>')];
+    const CHUNK = 2000;
     for (let ri = 0; ri < rows.length; ri += CHUNK) {
-      const parts = [];
-      for (let r = ri; r < Math.min(ri + CHUNK, rows.length); r++) {
-        parts.push(`<row r="${r+1}">`);
-        for (let ci = 0; ci < rows[r].length; ci++) {
-          const val = rows[r][ci];
-          const addr = colName(ci)+(r+1);
-          const s = String(val??"");
-          const isNum = s !== "" && s.trim() !== "" && !isNaN(Number(s));
-          parts.push(isNum
+      const buf = [];
+      const end = Math.min(ri + CHUNK, rows.length);
+      for (let r = ri; r < end; r++) {
+        buf.push(`<row r="${r+1}">`);
+        for (let c = 0; c < rows[r].length; c++) {
+          const v = rows[r][c];
+          const addr = colName(c) + (r + 1);
+          const s = String(v ?? "");
+          buf.push(s !== "" && !isNaN(Number(s))
             ? `<c r="${addr}"><v>${s}</v></c>`
-            : `<c r="${addr}" t="inlineStr"><is><t>${esc(val)}</t></is></c>`);
+            : `<c r="${addr}" t="inlineStr"><is><t>${esc(v)}</t></is></c>`);
         }
-        parts.push("</row>");
+        buf.push("</row>");
       }
-      blobs.push(encStr(parts.join("")));
+      chunks.push(toBytes(buf.join("")));
     }
-    blobs.push(encStr("</sheetData></worksheet>"));
-    // Concatenate all Uint8Arrays into one
-    const total = blobs.reduce((n, b) => n + b.length, 0);
+    chunks.push(toBytes("</sheetData></worksheet>"));
+    const total = chunks.reduce((n, b) => n + b.length, 0);
     const out = new Uint8Array(total);
     let pos = 0;
-    for (const b of blobs) { out.set(b, pos); pos += b.length; }
+    for (const b of chunks) { out.set(b, pos); pos += b.length; }
     return out;
   };
 
   const sheets = [
-    { name: "Summary",            rows: summaryRows },
-    { name: "Comparison Results", rows: compRows    },
-    { name: "Difference Mismatch",rows: diffRows    },
+    { name: "Summary",             rows: summaryRows },
+    { name: "Comparison Results",  rows: compRows    },
+    { name: "Difference Mismatch", rows: diffRows    },
   ];
 
-  const workbookXML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>${sheets.map((s,i)=>`<sheet name="${esc(s.name)}" sheetId="${i+1}" r:id="rId${i+1}"/>`).join("")}</sheets></workbook>`;
-  const workbookRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${sheets.map((s,i)=>`<Relationship Id="rId${i+1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i+1}.xml"/>`).join("")}</Relationships>`;
-  const contentTypes = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>${sheets.map((s,i)=>`<Override PartName="/xl/worksheets/sheet${i+1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join("")}</Types>`;
+  const wbXML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>${sheets.map((s,i)=>`<sheet name="${esc(s.name)}" sheetId="${i+1}" r:id="rId${i+1}"/>`).join("")}</sheets></workbook>`;
+  const wbRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${sheets.map((s,i)=>`<Relationship Id="rId${i+1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i+1}.xml"/>`).join("")}</Relationships>`;
+  const ct = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>${sheets.map((s,i)=>`<Override PartName="/xl/worksheets/sheet${i+1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join("")}</Types>`;
   const rootRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`;
 
+  // ── ZIP builder — uses DataView + set(), never spreads large arrays ──
+  // Spreading large Uint8Arrays (...data) into array literals crashes browsers.
+  const makeZip = files => {
+    const crcTable = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) { let c = i; for (let j = 0; j < 8; j++) c = (c&1)?(0xEDB88320^(c>>>1)):(c>>>1); crcTable[i]=c; }
+    const crc32 = d => { let c=0xFFFFFFFF; for (let i=0;i<d.length;i++) c=crcTable[(c^d[i])&0xFF]^(c>>>8); return (c^0xFFFFFFFF)>>>0; };
+
+    const parts = [], cds = [];
+    let offset = 0;
+
+    for (const f of files) {
+      const name = toBytes(f.name);
+      const data = f.data;
+      const crc = crc32(data);
+      const size = data.length;
+
+      // Local header: 30 bytes + name (no spread of data!)
+      const lh = new Uint8Array(30 + name.length);
+      const lv = new DataView(lh.buffer);
+      lh[0]=0x50;lh[1]=0x4B;lh[2]=0x03;lh[3]=0x04;
+      lv.setUint16(4,20,true); lv.setUint32(14,crc,true);
+      lv.setUint32(18,size,true); lv.setUint32(22,size,true);
+      lv.setUint16(26,name.length,true); lh.set(name,30);
+
+      // Central dir: 46 bytes + name
+      const cd = new Uint8Array(46 + name.length);
+      const cv = new DataView(cd.buffer);
+      cd[0]=0x50;cd[1]=0x4B;cd[2]=0x01;cd[3]=0x02;
+      cv.setUint16(4,20,true); cv.setUint16(6,20,true);
+      cv.setUint32(16,crc,true); cv.setUint32(20,size,true);
+      cv.setUint32(24,size,true); cv.setUint16(28,name.length,true);
+      cv.setUint32(42,offset,true); cd.set(name,46);
+
+      parts.push(lh, data); // header + data separately — never spread data!
+      cds.push(cd);
+      offset += lh.length + size;
+    }
+
+    const cdSize = cds.reduce((s,b)=>s+b.length,0);
+    const eocd = new Uint8Array(22);
+    const ev = new DataView(eocd.buffer);
+    eocd[0]=0x50;eocd[1]=0x4B;eocd[2]=0x05;eocd[3]=0x06;
+    ev.setUint16(8,files.length,true); ev.setUint16(10,files.length,true);
+    ev.setUint32(12,cdSize,true); ev.setUint32(16,offset,true);
+
+    const all = [...parts, ...cds, eocd];
+    const total = all.reduce((s,b)=>s+b.length,0);
+    const out = new Uint8Array(total);
+    let pos = 0;
+    for (const p of all) { out.set(p, pos); pos += p.length; }
+    return out;
+  };
+
   const zipFiles = [
-    { name: "[Content_Types].xml",          data: encStr(contentTypes) },
-    { name: "_rels/.rels",                  data: encStr(rootRels) },
-    { name: "xl/workbook.xml",              data: encStr(workbookXML) },
-    { name: "xl/_rels/workbook.xml.rels",   data: encStr(workbookRels) },
-    ...sheets.map((s,i) => ({ name: `xl/worksheets/sheet${i+1}.xml`, data: buildSheetBytes(s.rows) })),
+    { name: "[Content_Types].xml",        data: toBytes(ct)       },
+    { name: "_rels/.rels",                data: toBytes(rootRels) },
+    { name: "xl/workbook.xml",            data: toBytes(wbXML)    },
+    { name: "xl/_rels/workbook.xml.rels", data: toBytes(wbRels)   },
+    ...sheets.map((s, i) => ({ name: `xl/worksheets/sheet${i+1}.xml`, data: buildSheetBytes(s.rows) })),
   ];
 
   const zipped = makeZip(zipFiles);
@@ -360,7 +318,7 @@ async function exportToExcel(sessions, allMappings) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url; a.download = "CompareIQ_Results.xlsx"; a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 2000);
+  setTimeout(() => URL.revokeObjectURL(url), 3000);
 }
 
 // ─── Styles (LIGHT THEME) ────────────────────────────────────────────────────
@@ -853,9 +811,11 @@ export default function CompareIQ() {
 
             {/* COMPARISON SHEET */}
             {activeTab === "sheet" && (() => {
+              // Build the interleaved view
               const s0 = sessions[sessions.length - 1];
               if (!s0) return null;
               const cMaps0 = s0.mappings.filter(m => m.compare && !m.isKey && m.colA && m.colB);
+              const kMaps0 = s0.mappings.filter(m => m.isKey && m.colA && m.colB);
               const firstRowA = s0.results.find(r => r.rowA)?.rowA || {};
               const allColsA = Object.keys(firstRowA);
               const compareColsSet = new Set(cMaps0.map(m => m.colA));
@@ -864,8 +824,8 @@ export default function CompareIQ() {
               return (
                 <div>
                   <div style={{ background: C.blueLight, border: `1px solid ${C.blue}22`, borderRadius: 9, padding: "10px 14px", marginBottom: 10, fontSize: 11, display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap" }}>
-                    <span style={{ color: C.textMid }}>📋 <b style={{ color: C.text }}>2 rows per record</b> — Row 1 = File A values, Row 2 = File B values. Columns: Status | Source | Composite Key | all fields | Current | Current USOPTE | Difference | Comment</span>
-                    <span style={{ color: C.green, fontWeight: 700, marginLeft: "auto" }}>{sessions.reduce((a, s) => a + s.results.length * 2, 0)} rows across {sessions.length} session{sessions.length !== 1 ? "s" : ""}</span>
+                    <span style={{ color: C.textMid }}>📋 <b style={{ color: C.text }}>1 row per file per record</b> — shared cols shown once per row, <b style={{ color: C.red }}>compare cols highlighted in red</b> with Current | Current (USOPTE) | Difference | Comment</span>
+                    <span style={{ color: C.green, fontWeight: 700, marginLeft: "auto" }}>{sessions.reduce((a, s) => a + s.results.length * 2, 0)} total rows across {sessions.length} session{sessions.length !== 1 ? "s" : ""}</span>
                   </div>
 
                   <div style={{ ...S.card }}>
@@ -873,18 +833,18 @@ export default function CompareIQ() {
                       <table style={{ borderCollapse: "collapse", fontSize: 10 }}>
                         <thead style={{ position: "sticky", top: 0, zIndex: 2 }}>
                           <tr>
-                            <th style={{ ...S.th, background: C.headerBg, color: "#fff", minWidth: 80 }}>Status</th>
-                            <th style={{ ...S.th, background: C.headerBg, color: "#fff", minWidth: 120 }}>Source</th>
-                            <th style={{ ...S.th, background: C.headerBg, color: "#fff", minWidth: 160 }}>Composite Key</th>
-                            {sharedCols.map(c => (
-                              <th key={c} style={{ ...S.th, background: C.headerBg, color: "#CBD5E1", minWidth: 90 }}>{c}</th>
+                            <th style={{ ...S.th, minWidth: 80, background: C.headerBg, color: "#fff" }}>Status</th>
+                            <th style={{ ...S.th, minWidth: 100, background: C.headerBg, color: "#fff" }}>Source</th>
+                            <th style={{ ...S.th, minWidth: 160, background: C.headerBg, color: "#fff" }}>Composite Key</th>
+                            {sharedCols.map(c => <th key={c} style={{ ...S.th, background: C.headerBg, color: "#CBD5E1", minWidth: 90 }}>{c}</th>)}
+                            {cMaps0.map(m => (
+                              <>
+                                <th key={m.colA} style={{ ...S.th, background: "#7F1D1D", color: "#FCA5A5", borderLeft: "2px solid #991B1B", minWidth: 100 }}>{m.colA}</th>
+                                <th key={m.colB + "u"} style={{ ...S.th, background: "#7F1D1D", color: "#FCA5A5", minWidth: 120 }}>{m.colB} (USOPTE)</th>
+                                <th key={m.colA + "d"} style={{ ...S.th, background: "#7F1D1D", color: "#FCA5A5", minWidth: 80 }}>Difference</th>
+                                <th key={m.colA + "c"} style={{ ...S.th, background: "#7F1D1D", color: "#FCA5A5", borderRight: "2px solid #991B1B", minWidth: 130 }}>Comment</th>
+                              </>
                             ))}
-                            {cMaps0.map(m => [
-                              <th key={m.colA} style={{ ...S.th, background: "#7F1D1D", color: "#FCA5A5", borderLeft: "2px solid #991B1B", minWidth: 100 }}>{m.colA}</th>,
-                              <th key={m.colB+"u"} style={{ ...S.th, background: "#7F1D1D", color: "#FCA5A5", minWidth: 120 }}>{m.colB} (USOPTE)</th>,
-                              <th key={m.colA+"d"} style={{ ...S.th, background: "#7F1D1D", color: "#FCA5A5", minWidth: 80 }}>Difference</th>,
-                              <th key={m.colA+"c"} style={{ ...S.th, background: "#7F1D1D", color: "#FCA5A5", borderRight: "2px solid #991B1B", minWidth: 140 }}>SK Comment</th>,
-                            ])}
                           </tr>
                         </thead>
                         <tbody>
@@ -893,78 +853,71 @@ export default function CompareIQ() {
                             const sCmaps = s.mappings.filter(m => m.compare && !m.isKey && m.colA && m.colB);
                             const bMap = Object.fromEntries(s.mappings.filter(m => m.colA && m.colB).map(m => [m.colA, m.colB]));
 
-                            return s.results.slice(0, 150).flatMap((r, ri) => {
+                            return s.results.slice(0, 100).flatMap((r, ri) => {
                               const key = kMaps.map(m => r.keyVals[m.colA] ?? "").join("|");
                               const isMismatch = r.status !== "Matched";
-                              const bgA = isMismatch ? "#FFF5F5" : ri % 2 === 0 ? C.surface : C.bg;
-                              const bgB = isMismatch ? "#FFF0F0" : ri % 2 === 0 ? "#F5F8FF" : "#EFF4FF";
+                              const pairBg = isMismatch ? "#FFF5F5" : ri % 2 === 0 ? C.surface : C.bg;
+                              const pairBgB = isMismatch ? "#FFF0F0" : ri % 2 === 0 ? "#F5F8FF" : "#EFF4FF";
 
-                              // Row A
-                              const rowA = (
-                                <tr key={`${si}-${ri}-a`} style={{ background: bgA }}>
+                              const sharedValsA = sharedCols.map(c => r.rowA ? (r.rowA[c] ?? "") : "");
+                              const sharedValsB = sharedCols.map(c => { const cb = bMap[c]; return r.rowB && cb ? (r.rowB[cb] ?? "") : ""; });
+
+                              const cValsA = cMaps0.flatMap(m => {
+                                const sc = sCmaps.find(x => x.colA === m.colA);
+                                const valA = sc && r.rowA ? (r.rowA[sc.colA] ?? "") : "";
+                                const d = r.details?.find(d => d.colA === m.colA);
+                                const diff = d?.diff || "";
+                                const comment = makeComment(diff, d?.valA || "", d?.valB || "", r.status);
+                                const isMis = d?.status === "Mismatched";
+                                return [
+                                  <td key={m.colA} style={{ ...S.td, color: isMis ? C.red : C.blue, background: isMis ? "#FFDDDD" : "#FFF8F8", borderLeft: "2px solid #FECACA", fontWeight: isMis ? 700 : 400 }}>{valA || "—"}</td>,
+                                  <td key={m.colB + "u"} style={{ ...S.td, color: "#888", background: "#FFF8F8" }}>—</td>,
+                                  <td key={m.colA + "d"} style={{ ...S.td, color: isMis ? C.red : C.textLight, fontWeight: isMis ? 700 : 400, background: isMis ? "#FFDDDD" : "#FFF8F8" }}>{isMis ? diff : "—"}</td>,
+                                  <td key={m.colA + "c"} style={{ ...S.td, color: C.amber, fontStyle: "italic", background: "#FFF8F8", borderRight: "2px solid #FECACA" }}>{isMis ? comment : ""}</td>,
+                                ];
+                                const diff2 = d?.diff || ""; const isMis2 = d?.status === "Mismatched";
+                              });
+
+                              const cValsB = cMaps0.flatMap(m => {
+                                const sc = sCmaps.find(x => x.colA === m.colA);
+                                const valB = sc && r.rowB ? (r.rowB[sc.colB] ?? "") : "";
+                                const d = r.details?.find(d => d.colA === m.colA);
+                                const isMis = d?.status === "Mismatched";
+                                return [
+                                  <td key={m.colA} style={{ ...S.td, color: "#888", background: "#FFF8F8", borderLeft: "2px solid #FECACA" }}>—</td>,
+                                  <td key={m.colB + "u"} style={{ ...S.td, color: isMis ? C.purple : C.purple, background: isMis ? "#FFE8FF" : "#FFF8F8", fontWeight: isMis ? 700 : 400 }}>{valB || "—"}</td>,
+                                  <td key={m.colA + "d"} style={{ ...S.td, background: "#FFF8F8" }}>—</td>,
+                                  <td key={m.colA + "c"} style={{ ...S.td, background: "#FFF8F8", borderRight: "2px solid #FECACA" }}>—</td>,
+                                ];
+                              });
+
+                              return [
+                                <tr key={`${si}-${ri}-a`} style={{ background: pairBg }}>
                                   <td style={{ ...S.td }}><StatusBadge status={r.status} /></td>
-                                  <td style={{ ...S.td, color: C.blue, fontWeight: 600 }}>{s.fileAName}</td>
+                                  <td style={{ ...S.td, color: C.blue, fontWeight: 600, fontSize: 10 }}>{s.fileAName}</td>
                                   <td style={{ ...S.td, color: C.textMid, maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis" }}>{key}</td>
-                                  {sharedCols.map(c => (
-                                    <td key={c} style={{ ...S.td, color: C.textMid }}>{r.rowA ? (r.rowA[c] ?? "—") : "—"}</td>
-                                  ))}
-                                  {cMaps0.map(m => {
-                                    const sc = sCmaps.find(x => x.colA === m.colA);
-                                    const valA = sc && r.rowA ? (r.rowA[sc.colA] ?? "") : "";
-                                    const valB = sc && r.rowB ? (r.rowB[sc.colB] ?? "") : "";
-                                    const d = r.details?.find(d => d.colA === m.colA);
-                                    const diff = d?.diff || "";
-                                    const isMis = d?.status === "Mismatched";
-                                    const comment = makeComment(diff, valA, valB, r.status);
-                                    return [
-                                      <td key={m.colA} style={{ ...S.td, color: isMis ? C.red : C.blue, background: "#FFF8F8", borderLeft: "2px solid #FECACA", fontWeight: isMis ? 700 : 400 }}>{valA || "—"}</td>,
-                                      <td key={m.colB+"u"} style={{ ...S.td, color: C.textLight, background: "#FFF8F8" }}>—</td>,
-                                      <td key={m.colA+"d"} style={{ ...S.td, color: isMis ? C.red : C.textLight, fontWeight: isMis ? 700 : 400, background: "#FFF8F8" }}>{isMis ? diff : "—"}</td>,
-                                      <td key={m.colA+"c"} style={{ ...S.td, color: C.amber, fontStyle: "italic", background: "#FFF8F8", borderRight: "2px solid #FECACA" }}>{comment || "—"}</td>,
-                                    ];
-                                  })}
-                                </tr>
-                              );
-
-                              // Row B
-                              const rowB = (
-                                <tr key={`${si}-${ri}-b`} style={{ background: bgB, borderBottom: `2px solid ${C.border}` }}>
+                                  {sharedValsA.map((v, vi) => <td key={vi} style={{ ...S.td, color: C.textMid }}>{v}</td>)}
+                                  {cValsA}
+                                </tr>,
+                                <tr key={`${si}-${ri}-b`} style={{ background: pairBgB, borderBottom: `2px solid ${C.border}` }}>
                                   <td style={{ ...S.td, color: C.textLight }}></td>
-                                  <td style={{ ...S.td, color: C.purple, fontWeight: 600 }}>{s.fileBName}</td>
-                                  <td style={{ ...S.td, color: C.textLight, maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis" }}>{key}</td>
-                                  {sharedCols.map(c => {
-                                    const cb = bMap[c] || c;
-                                    return <td key={c} style={{ ...S.td, color: C.textLight }}>{r.rowB ? (r.rowB[cb] ?? "—") : "—"}</td>;
-                                  })}
-                                  {cMaps0.map(m => {
-                                    const sc = sCmaps.find(x => x.colA === m.colA);
-                                    const valB = sc && r.rowB ? (r.rowB[sc.colB] ?? "") : "";
-                                    const d = r.details?.find(d => d.colA === m.colA);
-                                    const isMis = d?.status === "Mismatched";
-                                    return [
-                                      <td key={m.colA} style={{ ...S.td, color: C.textLight, background: "#FFF8F8", borderLeft: "2px solid #FECACA" }}>—</td>,
-                                      <td key={m.colB+"u"} style={{ ...S.td, color: isMis ? C.purple : C.purple, fontWeight: isMis ? 700 : 400, background: isMis ? "#F5E8FF" : "#FFF8F8" }}>{valB || "—"}</td>,
-                                      <td key={m.colA+"d"} style={{ ...S.td, color: C.textLight, background: "#FFF8F8" }}>—</td>,
-                                      <td key={m.colA+"c"} style={{ ...S.td, color: C.textLight, background: "#FFF8F8", borderRight: "2px solid #FECACA" }}>—</td>,
-                                    ];
-                                  })}
+                                  <td style={{ ...S.td, color: C.purple, fontWeight: 600, fontSize: 10 }}>{s.fileBName}</td>
+                                  <td style={{ ...S.td, color: C.textLight }}>{key}</td>
+                                  {sharedValsB.map((v, vi) => <td key={vi} style={{ ...S.td, color: C.textLight }}>{v}</td>)}
+                                  {cValsB}
                                 </tr>
-                              );
-
-                              return [rowA, rowB];
+                              ];
                             });
                           })}
                         </tbody>
                       </table>
-                      {sessions.reduce((a, s) => a + s.results.length, 0) > 150 && (
-                        <div style={{ padding: 10, textAlign: "center", color: C.textLight, fontSize: 10, borderTop: `1px solid ${C.border}` }}>
-                          Showing first 150 records — Export Excel for all {sessions.reduce((a, s) => a + s.results.length, 0).toLocaleString()} records
-                        </div>
+                      {sessions.reduce((a, s) => a + s.results.length, 0) > 100 && (
+                        <div style={{ padding: 10, textAlign: "center", color: C.textLight, fontSize: 10, borderTop: `1px solid ${C.border}` }}>Showing first 100 records per session — Export Excel for complete data</div>
                       )}
                     </div>
                   </div>
                   <div style={{ marginTop: 8, fontSize: 10, color: C.textLight, textAlign: "center" }}>
-                    Row 1 per record = <b style={{ color: C.blue }}>File A</b> &nbsp;·&nbsp; Row 2 = <b style={{ color: C.purple }}>File B</b> &nbsp;·&nbsp; <b style={{ color: C.red }}>Red cols</b> = Current | Current USOPTE | Difference | SK Comment
+                    <b style={{ color: C.red }}>Red columns</b> = comparison fields (Current, Current USOPTE, Difference, Comment) &nbsp;·&nbsp; Thick line separates each record pair &nbsp;·&nbsp; Export Excel for full formatted workbook
                   </div>
                 </div>
               );
