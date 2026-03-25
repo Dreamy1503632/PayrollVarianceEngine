@@ -1,6 +1,5 @@
-import { useState, useRef } from "react";
+import React, { useState, useRef } from "react";
 
-// ─── Parsers ─────────────────────────────────────────────────────────────────
 function parseCSV(text) {
   const lines = text.trim().split(/\r?\n/);
   if (!lines.length) return [];
@@ -77,7 +76,6 @@ async function parseFile(file) {
   });
 }
 
-// ─── Auto map headers ────────────────────────────────────────────────────────
 function autoMapHeaders(headersA, headersB) {
   const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
   const usedB = new Set();
@@ -97,7 +95,6 @@ function autoMapHeaders(headersA, headersB) {
   });
 }
 
-// ─── Compare engine ──────────────────────────────────────────────────────────
 function compareDatasets(dataA, dataB, mappings, tolerance) {
   const tolPct = parseFloat(tolerance) / 100 || 0;
   const keyMaps = mappings.filter(m => m.isKey && m.colA && m.colB);
@@ -141,7 +138,6 @@ function compareDatasets(dataA, dataB, mappings, tolerance) {
   return { results, duplicatesA: Object.values(kc).filter(c => c > 1).reduce((s, c) => s + c - 1, 0) };
 }
 
-// ─── Comment helper ──────────────────────────────────────────────────────────
 function makeComment(diff, valA, valB, status) {
   if (status === "Only in A") return "Only in File A";
   if (status === "Only in B") return "Only in File B";
@@ -151,103 +147,125 @@ function makeComment(diff, valA, valB, status) {
   return "Value mismatch";
 }
 
-// ─── Raw XLSX writer — pure browser, zero external dependencies ──────────────
-// Builds a valid .xlsx (ZIP + XML) entirely in the browser.
-// No SheetJS, no fflate — just a minimal ZIP implementation.
-async function exportToExcel(sessions, allMappings) {
+// ─── CRC32 ───────────────────────────────────────────────────────────────────
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let j = 0; j < 8; j++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[i] = c;
+  }
+  return t;
+})();
+function crc32(data) {
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < data.length; i++) crc = CRC_TABLE[(crc ^ data[i]) & 0xFF] ^ (crc >>> 8);
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
 
-  // ── Minimal ZIP builder (store only, no compression) ──────────────────────
-  function makeZip(files) {
-    // files: array of { name: string, data: Uint8Array }
-    const enc = t => new TextEncoder().encode(t);
-    const u32 = n => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n, true); return b; };
-    const u16 = n => { const b = new Uint8Array(2); new DataView(b.buffer).setUint16(0, n, true); return b; };
+// ─── Concat Uint8Arrays ──────────────────────────────────────────────────────
+function concatU8(arrays) {
+  const total = arrays.reduce((s, a) => s + a.length, 0);
+  const out = new Uint8Array(total);
+  let pos = 0;
+  for (const a of arrays) { out.set(a, pos); pos += a.length; }
+  return out;
+}
 
-    // CRC32 table
-    const crcTable = new Uint32Array(256);
-    for (let i = 0; i < 256; i++) {
-      let c = i;
-      for (let j = 0; j < 8; j++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
-      crcTable[i] = c;
+// ─── Build sheet data as a Blob (avoids giant string) ────────────────────────
+function buildSheetBlob(rows) {
+  const enc = new TextEncoder();
+  const esc = s => String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+  const colName = n => { let s=""; for(;n>=0;n=Math.floor(n/26)-1) s=String.fromCharCode(65+n%26)+s; return s; };
+
+  const blobParts = [];
+  blobParts.push(enc.encode('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>'));
+
+  // Process in chunks of 2000 rows to avoid large string allocation
+  const CHUNK = 2000;
+  for (let start = 0; start < rows.length; start += CHUNK) {
+    const chunk = rows.slice(start, start + CHUNK);
+    const parts = [];
+    for (let ri = 0; ri < chunk.length; ri++) {
+      const rowIdx = start + ri;
+      parts.push(`<row r="${rowIdx + 1}">`);
+      const row = chunk[ri];
+      for (let ci = 0; ci < row.length; ci++) {
+        const val = row[ci];
+        const addr = colName(ci) + (rowIdx + 1);
+        const s = String(val ?? "");
+        const isNum = s !== "" && !isNaN(Number(s)) && s.trim() !== "";
+        if (isNum) {
+          parts.push(`<c r="${addr}"><v>${s}</v></c>`);
+        } else {
+          parts.push(`<c r="${addr}" t="inlineStr"><is><t>${esc(val)}</t></is></c>`);
+        }
+      }
+      parts.push("</row>");
     }
-    function crc32(data) {
-      let crc = 0xFFFFFFFF;
-      for (let i = 0; i < data.length; i++) crc = crcTable[(crc ^ data[i]) & 0xFF] ^ (crc >>> 8);
-      return (crc ^ 0xFFFFFFFF) >>> 0;
-    }
-
-    const localHeaders = [];
-    const centralDir = [];
-    let offset = 0;
-
-    for (const file of files) {
-      const nameBytes = enc(file.name);
-      const data = file.data;
-      const crc = crc32(data);
-      const size = data.length;
-
-      // Local file header
-      const lh = new Uint8Array([
-        0x50,0x4B,0x03,0x04, // signature
-        20,0,                 // version needed
-        0,0,                  // flags
-        0,0,                  // compression: store
-        0,0,0,0,              // mod time/date
-        ...u32(crc),
-        ...u32(size),
-        ...u32(size),
-        ...u16(nameBytes.length),
-        0,0,                  // extra field length
-        ...nameBytes,
-        ...data,
-      ]);
-
-      // Central directory entry
-      const cd = new Uint8Array([
-        0x50,0x4B,0x01,0x02, // signature
-        20,0,                 // version made by
-        20,0,                 // version needed
-        0,0,                  // flags
-        0,0,                  // compression: store
-        0,0,0,0,              // mod time/date
-        ...u32(crc),
-        ...u32(size),
-        ...u32(size),
-        ...u16(nameBytes.length),
-        0,0,                  // extra
-        0,0,                  // comment
-        0,0,                  // disk start
-        0,0,                  // internal attr
-        0,0,0,0,              // external attr
-        ...u32(offset),
-        ...nameBytes,
-      ]);
-
-      localHeaders.push(lh);
-      centralDir.push(cd);
-      offset += lh.length;
-    }
-
-    const cdSize = centralDir.reduce((s, b) => s + b.length, 0);
-    const eocd = new Uint8Array([
-      0x50,0x4B,0x05,0x06, // signature
-      0,0,0,0,              // disk numbers
-      ...u16(files.length),
-      ...u16(files.length),
-      ...u32(cdSize),
-      ...u32(offset),
-      0,0,                  // comment length
-    ]);
-
-    const parts = [...localHeaders, ...centralDir, eocd];
-    const total = parts.reduce((s, b) => s + b.length, 0);
-    const out = new Uint8Array(total);
-    let pos = 0;
-    for (const p of parts) { out.set(p, pos); pos += p.length; }
-    return out;
+    blobParts.push(enc.encode(parts.join("")));
   }
 
-  // ── Data setup ────────────────────────────────────────────────────────────
+  blobParts.push(enc.encode("</sheetData></worksheet>"));
+  return new Blob(blobParts);
+}
+
+// ─── Convert Blob to Uint8Array ───────────────────────────────────────────────
+async function blobToU8(blob) {
+  const buf = await blob.arrayBuffer();
+  return new Uint8Array(buf);
+}
+
+// ─── ZIP builder (store, no compression) ─────────────────────────────────────
+function makeZip(files) {
+  // files: { name: string, data: Uint8Array }[]
+  const enc = s => new TextEncoder().encode(s);
+  const u32 = n => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n, true); return b; };
+  const u16 = n => { const b = new Uint8Array(2); new DataView(b.buffer).setUint16(0, n, true); return b; };
+
+  const localHeaders = [];
+  const centralDir = [];
+  let offset = 0;
+
+  for (const file of files) {
+    const nameBytes = enc(file.name);
+    const data = file.data;
+    const crc = crc32(data);
+    const size = data.length;
+
+    const lh = concatU8([
+      new Uint8Array([0x50,0x4B,0x03,0x04, 20,0, 0,0, 0,0, 0,0,0,0]),
+      u32(crc), u32(size), u32(size),
+      u16(nameBytes.length), new Uint8Array([0,0]),
+      nameBytes, data,
+    ]);
+
+    const cd = concatU8([
+      new Uint8Array([0x50,0x4B,0x01,0x02, 20,0, 20,0, 0,0, 0,0, 0,0,0,0]),
+      u32(crc), u32(size), u32(size),
+      u16(nameBytes.length),
+      new Uint8Array([0,0, 0,0, 0,0, 0,0,0,0, 0,0,0,0]),
+      u32(offset), nameBytes,
+    ]);
+
+    localHeaders.push(lh);
+    centralDir.push(cd);
+    offset += lh.length;
+  }
+
+  const cdSize = centralDir.reduce((s, b) => s + b.length, 0);
+  const eocd = concatU8([
+    new Uint8Array([0x50,0x4B,0x05,0x06, 0,0, 0,0]),
+    u16(files.length), u16(files.length),
+    u32(cdSize), u32(offset),
+    new Uint8Array([0,0]),
+  ]);
+
+  return concatU8([...localHeaders, ...centralDir, eocd]);
+}
+
+// ─── Export to Excel ──────────────────────────────────────────────────────────
+async function exportToExcel(sessions) {
   const s0 = sessions[0];
   const cMaps0 = s0.mappings.filter(m => m.compare && !m.isKey && m.colA && m.colB);
   const firstRowA = s0.results.find(r => r.rowA)?.rowA || {};
@@ -296,35 +314,17 @@ async function exportToExcel(sessions, allMappings) {
     ...sessions.map((s,i)=>[i+1,s.fileAName,s.fileBName,s.totalA,s.totalB,s.matched,s.mismatched,s.onlyA,s.onlyB,s.duplicates,`${((s.matched/(s.matched+s.mismatched||1))*100).toFixed(1)}%`])
   ];
 
-  // ── XML helpers ───────────────────────────────────────────────────────────
-  const esc = s => String(s??"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&apos;");
-  const colName = n => { let s=""; for(;n>=0;n=Math.floor(n/26)-1) s=String.fromCharCode(65+n%26)+s; return s; };
   const enc = s => new TextEncoder().encode(s);
-
-  const buildSheetXML = rows => {
-    const parts = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>'];
-    for (let ri = 0; ri < rows.length; ri++) {
-      parts.push(`<row r="${ri+1}">`);
-      for (let ci = 0; ci < rows[ri].length; ci++) {
-        const val = rows[ri][ci];
-        const addr = colName(ci)+(ri+1);
-        const s = String(val??"");
-        const isNum = s !== "" && !isNaN(Number(s)) && s.trim() !== "";
-        parts.push(isNum
-          ? `<c r="${addr}"><v>${s}</v></c>`
-          : `<c r="${addr}" t="inlineStr"><is><t>${esc(val)}</t></is></c>`);
-      }
-      parts.push("</row>");
-    }
-    parts.push("</sheetData></worksheet>");
-    return parts.join("");
-  };
+  const esc = s => String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 
   const sheets = [
-    { name: "Summary",            rows: summaryRows },
-    { name: "Comparison Results", rows: compRows    },
-    { name: "Difference Mismatch",rows: diffRows    },
+    { name: "Summary",             rows: summaryRows },
+    { name: "Comparison Results",  rows: compRows    },
+    { name: "Difference Mismatch", rows: diffRows    },
   ];
+
+  // Build sheet XMLs as Blobs first (memory-efficient), then convert to Uint8Array
+  const sheetU8s = await Promise.all(sheets.map(s => blobToU8(buildSheetBlob(s.rows))));
 
   const workbookXML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>${sheets.map((s,i)=>`<sheet name="${esc(s.name)}" sheetId="${i+1}" r:id="rId${i+1}"/>`).join("")}</sheets></workbook>`;
   const workbookRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${sheets.map((s,i)=>`<Relationship Id="rId${i+1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i+1}.xml"/>`).join("")}</Relationships>`;
@@ -332,11 +332,11 @@ async function exportToExcel(sessions, allMappings) {
   const rootRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`;
 
   const zipFiles = [
-    { name: "[Content_Types].xml",          data: enc(contentTypes) },
-    { name: "_rels/.rels",                  data: enc(rootRels) },
-    { name: "xl/workbook.xml",              data: enc(workbookXML) },
-    { name: "xl/_rels/workbook.xml.rels",   data: enc(workbookRels) },
-    ...sheets.map((s,i) => ({ name: `xl/worksheets/sheet${i+1}.xml`, data: enc(buildSheetXML(s.rows)) })),
+    { name: "[Content_Types].xml",        data: enc(contentTypes) },
+    { name: "_rels/.rels",                data: enc(rootRels) },
+    { name: "xl/workbook.xml",            data: enc(workbookXML) },
+    { name: "xl/_rels/workbook.xml.rels", data: enc(workbookRels) },
+    ...sheets.map((s,i) => ({ name: `xl/worksheets/sheet${i+1}.xml`, data: sheetU8s[i] })),
   ];
 
   const zipped = makeZip(zipFiles);
@@ -344,10 +344,10 @@ async function exportToExcel(sessions, allMappings) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url; a.download = "CompareIQ_Results.xlsx"; a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 2000);
+  setTimeout(() => URL.revokeObjectURL(url), 3000);
 }
 
-// ─── Styles (LIGHT THEME) ────────────────────────────────────────────────────
+// ─── Styles ───────────────────────────────────────────────────────────────────
 const C = {
   bg: "#F7F9FC", surface: "#FFFFFF", border: "#D1D9E6", borderStrong: "#A0B0C8",
   text: "#1A2332", textMid: "#4A5568", textLight: "#718096",
@@ -393,13 +393,9 @@ export default function CompareIQ() {
   const [sessions, setSessions] = useState([]);
 
   const handleExport = async () => {
-    setExporting(true);
-    setError("");
-    try {
-      await exportToExcel(sessions, mappings);
-    } catch (e) {
-      setError(`Export failed: ${e.message}`);
-    }
+    setExporting(true); setError("");
+    try { await exportToExcel(sessions); }
+    catch (e) { setError(`Export failed: ${e.message}`); }
     setExporting(false);
   };
 
@@ -422,8 +418,6 @@ export default function CompareIQ() {
   };
 
   const updateMapping = (i, field, val) => setMappings(p => p.map((m, idx) => idx === i ? { ...m, [field]: val } : m));
-
-  // Select/deselect all compare
   const setAllCompare = (val) => setMappings(p => p.map(m => m.isKey ? m : { ...m, compare: val }));
   const allCompareOn = mappings.filter(m => !m.isKey).every(m => m.compare);
   const anyCompareOn = mappings.filter(m => !m.isKey).some(m => m.compare);
@@ -459,7 +453,6 @@ export default function CompareIQ() {
     (!searchKey || r.key.toLowerCase().includes(searchKey.toLowerCase()))
   ) : [];
 
-  // ── Sub-components ───────────────────────────────────────────────────────
   const DropZone = ({ label, file, onFile, color }) => {
     const ref = useRef(); const [drag, setDrag] = useState(false);
     return (
@@ -504,7 +497,7 @@ export default function CompareIQ() {
     <div style={{ minHeight: "100vh", background: C.bg, color: C.text, fontFamily: "'Inter','Segoe UI',sans-serif" }}>
       <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
 
-      {/* ── Header ── */}
+      {/* Header */}
       <div style={{ background: C.headerBg, padding: "12px 28px", display: "flex", alignItems: "center", justifyContent: "space-between", position: "sticky", top: 0, zIndex: 50, boxShadow: "0 2px 8px rgba(0,0,0,0.15)" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ width: 32, height: 32, borderRadius: 8, background: "linear-gradient(135deg,#3B82F6,#7C3AED)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16 }}>⚖️</div>
@@ -530,9 +523,9 @@ export default function CompareIQ() {
       <div style={{ maxWidth: 1100, margin: "0 auto", padding: "28px 20px" }}>
         {error && <div style={{ background: C.redLight, border: `1px solid ${C.red}33`, color: C.red, borderRadius: 9, padding: "9px 14px", marginBottom: 14, fontSize: 12, display: "flex", justifyContent: "space-between", alignItems: "center" }}>⚠️ {error}<button onClick={() => setError("")} style={{ background: "none", border: "none", color: C.red, cursor: "pointer", fontSize: 16, lineHeight: 1 }}>×</button></div>}
         {loading && <div style={{ background: C.blueLight, border: `1px solid ${C.blue}33`, borderRadius: 9, padding: "9px 14px", marginBottom: 14, fontSize: 12, color: C.blue }}>⏳ Processing…</div>}
-        {exporting && <div style={{ background: C.amberLight, border: `1px solid ${C.amber}33`, borderRadius: 9, padding: "9px 14px", marginBottom: 14, fontSize: 12, color: C.amber, fontWeight: 600 }}>⏳ Building Excel file — writing {sessions.reduce((a, s) => a + s.results.length, 0).toLocaleString()} records to XLSX…</div>}
+        {exporting && <div style={{ background: C.amberLight, border: `1px solid ${C.amber}33`, borderRadius: 9, padding: "9px 14px", marginBottom: 14, fontSize: 12, color: C.amber, fontWeight: 600 }}>⏳ Building Excel file…</div>}
 
-        {/* ══ STEP 0 — UPLOAD ══ */}
+        {/* STEP 0 — UPLOAD */}
         {step === 0 && (
           <div>
             <div style={{ textAlign: "center", marginBottom: 28 }}>
@@ -569,7 +562,7 @@ export default function CompareIQ() {
           </div>
         )}
 
-        {/* ══ STEP 1 — COLUMN MAPPING ══ */}
+        {/* STEP 1 — COLUMN MAPPING */}
         {step === 1 && (
           <div>
             <div style={{ marginBottom: 18 }}>
@@ -588,14 +581,10 @@ export default function CompareIQ() {
                 <span style={{ fontSize: 11, color: C.textLight }}>Compare: <b style={{ color: C.green }}>{mappings.filter(m => m.compare && !m.isKey).length}</b></span>
               </div>
             </div>
-
-            {/* Info banner */}
             <div style={{ background: C.blueLight, border: `1px solid ${C.blue}22`, borderRadius: 9, padding: "10px 14px", marginBottom: 14, fontSize: 12, color: C.textMid, display: "flex", alignItems: "center", gap: 8 }}>
               <span style={{ color: C.blue, fontSize: 16 }}>ℹ</span>
               Map columns, set <b style={{ color: C.amber }}>Key</b> columns for row matching, toggle <b style={{ color: C.green }}>Compare</b> for value comparison.
             </div>
-
-            {/* Tolerance + actions */}
             <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 10, padding: "10px 14px", ...S.card, boxShadow: "none" }}>
               <span style={{ ...S.label }}>⚙ GLOBAL TOLERANCE</span>
               <input type="number" min="0" max="100" step="0.1" value={tolerance} onChange={e => setTolerance(e.target.value)}
@@ -606,10 +595,7 @@ export default function CompareIQ() {
               <button onClick={() => setMappings(p => [...p, { colA: headersA[0] || "", colB: headersB[0] || "", isKey: false, compare: true, ignoreCase: false }])}
                 style={{ ...S.btn(false), fontSize: 12, fontWeight: 700 }}>+ Add Row</button>
             </div>
-
-            {/* Mapping table */}
             <div style={{ ...S.card, marginBottom: 16 }}>
-              {/* Table header */}
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 64px 80px 96px 32px", background: "#F0F4FA", padding: "8px 14px", borderBottom: `1px solid ${C.border}` }}>
                 {[
                   { label: `DATASET 1 — ${fileA?.name}`, color: C.blue },
@@ -623,7 +609,6 @@ export default function CompareIQ() {
                     {i === 3 ? (
                       <>
                         <span style={{ color: C.green }}>COMPARE ✓</span>
-                        {/* Select All / Deselect All dropdown */}
                         <div style={{ display: "flex", gap: 4, marginTop: 2 }}>
                           <button onClick={() => setAllCompare(true)} style={{ ...S.btn(allCompareOn, C.green), padding: "2px 7px", fontSize: 9, fontWeight: 700 }}>All</button>
                           <button onClick={() => setAllCompare(false)} style={{ ...S.btn(!anyCompareOn, C.red), padding: "2px 7px", fontSize: 9, fontWeight: 700 }}>None</button>
@@ -633,8 +618,6 @@ export default function CompareIQ() {
                   </div>
                 ))}
               </div>
-
-              {/* Rows */}
               <div style={{ maxHeight: 380, overflowY: "auto" }}>
                 {mappings.map((m, i) => (
                   <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 1fr 64px 80px 96px 32px", alignItems: "center", padding: "6px 14px", borderBottom: `1px solid ${C.border}20`, background: m.isKey ? "#FFFBEB" : i % 2 ? C.surface : C.bg }}>
@@ -649,8 +632,6 @@ export default function CompareIQ() {
                   </div>
                 ))}
               </div>
-
-              {/* Footer */}
               <div style={{ padding: "8px 14px", background: "#F8FAFC", borderTop: `1px solid ${C.border}`, display: "flex", gap: 16, fontSize: 11 }}>
                 <span style={{ color: C.textLight }}>Total: <b style={{ color: C.blue }}>{mappings.length}</b></span>
                 <span style={{ color: C.textLight }}>Keys: <b style={{ color: C.amber }}>{mappings.filter(m => m.isKey).length}</b></span>
@@ -658,7 +639,6 @@ export default function CompareIQ() {
                 <span style={{ color: C.textLight }}>Ignore Case: <b>{mappings.filter(m => m.ignoreCase).length}</b></span>
               </div>
             </div>
-
             <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
               <button onClick={() => setStep(0)} style={{ ...S.btn(false), padding: "10px 22px" }}>← Back</button>
               <button onClick={runComparison} style={S.btnPrimary}>🚀 Run Comparison</button>
@@ -666,10 +646,9 @@ export default function CompareIQ() {
           </div>
         )}
 
-        {/* ══ STEP 2 — RESULTS ══ */}
+        {/* STEP 2 — RESULTS */}
         {step === 2 && stats && (
           <div>
-            {/* Summary cards */}
             <div style={{ display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: 8, marginBottom: 16 }}>
               {[
                 { label: "Total A", val: stats.totalA, color: C.blue, bg: C.blueLight },
@@ -680,14 +659,13 @@ export default function CompareIQ() {
                 { label: "Only in B", val: stats.onlyB, color: C.purple, bg: C.purpleLight },
                 { label: "Duplicates", val: stats.duplicates, color: C.textMid, bg: "#F1F5F9" },
               ].map(s => (
-                <div key={s.label} style={{ background: s.bg, border: `1px solid ${s.color}30`, borderTop: `3px solid ${s.color}`, borderRadius: 10, padding: "12px 8px", textAlign: "center", boxShadow: "0 1px 3px rgba(0,0,0,0.04)" }}>
+                <div key={s.label} style={{ background: s.bg, border: `1px solid ${s.color}30`, borderTop: `3px solid ${s.color}`, borderRadius: 10, padding: "12px 8px", textAlign: "center" }}>
                   <div style={{ fontSize: 20, fontWeight: 800, color: s.color }}>{s.val}</div>
                   <div style={{ fontSize: 9, color: C.textLight, marginTop: 2, fontWeight: 600, letterSpacing: "0.05em" }}>{s.label.toUpperCase()}</div>
                 </div>
               ))}
             </div>
 
-            {/* Match rate bar */}
             <div style={{ ...S.card, padding: "12px 16px", marginBottom: 14, boxShadow: "none" }}>
               <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 7 }}>
                 <span style={{ color: C.textMid, fontWeight: 600 }}>Match Rate — {fileA?.name} vs {fileB?.name}</span>
@@ -703,11 +681,10 @@ export default function CompareIQ() {
 
             {sessions.length > 1 && (
               <div style={{ background: C.greenLight, border: `1px solid ${C.green}33`, borderRadius: 9, padding: "8px 14px", marginBottom: 12, fontSize: 11, color: C.green, fontWeight: 600 }}>
-                📚 {sessions.length} sessions accumulated — Export Excel will include all sessions in one workbook
+                📚 {sessions.length} sessions accumulated — Export Excel will include all sessions
               </div>
             )}
 
-            {/* Tab bar */}
             <div style={{ display: "flex", gap: 5, marginBottom: 14, alignItems: "center", flexWrap: "wrap" }}>
               {[["dashboard", "📊 Dashboard"], ["detail", "🔍 Detail Report"], ["sheet", "📋 Comparison Sheet"]].map(([t, label]) => (
                 <button key={t} onClick={() => setActiveTab(t)} style={S.btn(activeTab === t)}>{label}</button>
@@ -717,8 +694,7 @@ export default function CompareIQ() {
                 style={{ ...S.btn(false), background: exporting ? C.textLight : C.green, color: "#fff", border: "none", fontWeight: 700, padding: "7px 16px", opacity: exporting ? 0.7 : 1, cursor: exporting ? "wait" : "pointer" }}>
                 {exporting ? "⏳ Exporting…" : `⬇ Export Excel (${sessions.length} session${sessions.length > 1 ? "s" : ""})`}
               </button>
-              <button onClick={() => { setStep(0); setResults(null); }}
-                style={{ ...S.btn(false), color: C.blue, borderColor: C.blue, fontWeight: 700 }}>+ New Comparison</button>
+              <button onClick={() => { setStep(0); setResults(null); }} style={{ ...S.btn(false), color: C.blue, borderColor: C.blue, fontWeight: 700 }}>+ New Comparison</button>
               <button onClick={() => setStep(1)} style={S.btn(false)}>← Remap</button>
             </div>
 
@@ -795,12 +771,12 @@ export default function CompareIQ() {
                         <th style={S.th}>Composite Key</th>
                         {keyMappings.map(m => <th key={m.colA} style={{ ...S.th, color: C.amber }}>{m.colA}</th>)}
                         {compareMappings.map(m => (
-                          <>
-                            <th key={m.colA + "a"} style={{ ...S.th, color: C.blue, borderLeft: `2px solid ${C.border}` }}>{m.colA}</th>
-                            <th key={m.colA + "b"} style={{ ...S.th, color: C.purple }}>{m.colB} (B)</th>
-                            <th key={m.colA + "d"} style={{ ...S.th, color: C.amber }}>Diff</th>
-                            <th key={m.colA + "c"} style={{ ...S.th, color: C.textLight }}>Comment</th>
-                          </>
+                          <React.Fragment key={m.colA}>
+                            <th style={{ ...S.th, color: C.blue, borderLeft: `2px solid ${C.border}` }}>{m.colA}</th>
+                            <th style={{ ...S.th, color: C.purple }}>{m.colB} (B)</th>
+                            <th style={{ ...S.th, color: C.amber }}>Diff</th>
+                            <th style={{ ...S.th, color: C.textLight }}>Comment</th>
+                          </React.Fragment>
                         ))}
                         <th style={S.th}>Status</th>
                       </tr>
@@ -816,12 +792,12 @@ export default function CompareIQ() {
                             const diff = d?.diff || "";
                             const comment = makeComment(diff, d?.valA || "", d?.valB || "", r.status);
                             return (
-                              <>
-                                <td key={m.colA + "a"} style={{ ...S.td, color: C.blue, borderLeft: `2px solid ${C.border}`, background: isMis ? C.redLight : "transparent" }}>{d ? d.valA : (r.rowA ? r.rowA[m.colA] ?? "—" : "—")}</td>
-                                <td key={m.colA + "b"} style={{ ...S.td, color: C.purple, background: isMis ? C.redLight : "transparent" }}>{d ? d.valB : (r.rowB ? r.rowB[m.colB] ?? "—" : "—")}</td>
-                                <td key={m.colA + "d"} style={{ ...S.td, color: isMis ? C.red : C.textLight, fontWeight: isMis ? 700 : 400 }}>{diff || "—"}</td>
-                                <td key={m.colA + "c"} style={{ ...S.td, color: C.amber, fontStyle: "italic", fontSize: 10 }}>{comment}</td>
-                              </>
+                              <React.Fragment key={m.colA}>
+                                <td style={{ ...S.td, color: C.blue, borderLeft: `2px solid ${C.border}`, background: isMis ? C.redLight : "transparent" }}>{d ? d.valA : (r.rowA ? r.rowA[m.colA] ?? "—" : "—")}</td>
+                                <td style={{ ...S.td, color: C.purple, background: isMis ? C.redLight : "transparent" }}>{d ? d.valB : (r.rowB ? r.rowB[m.colB] ?? "—" : "—")}</td>
+                                <td style={{ ...S.td, color: isMis ? C.red : C.textLight, fontWeight: isMis ? 700 : 400 }}>{diff || "—"}</td>
+                                <td style={{ ...S.td, color: C.amber, fontStyle: "italic", fontSize: 10 }}>{comment}</td>
+                              </React.Fragment>
                             );
                           })}
                           <td style={S.td}><StatusBadge status={r.status} /></td>
@@ -844,15 +820,13 @@ export default function CompareIQ() {
               const allColsA = Object.keys(firstRowA);
               const compareColsSet = new Set(cMaps0.map(m => m.colA));
               const sharedCols = allColsA.filter(c => !compareColsSet.has(c));
-
               return (
                 <div>
                   <div style={{ background: C.blueLight, border: `1px solid ${C.blue}22`, borderRadius: 9, padding: "10px 14px", marginBottom: 10, fontSize: 11, display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap" }}>
-                    <span style={{ color: C.textMid }}>📋 <b style={{ color: C.text }}>2 rows per record</b> — Row 1 = File A values, Row 2 = File B values. Columns: Status | Source | Composite Key | all fields | Current | Current USOPTE | Difference | Comment</span>
+                    <span style={{ color: C.textMid }}>📋 <b style={{ color: C.text }}>2 rows per record</b> — Row 1 = File A values, Row 2 = File B values.</span>
                     <span style={{ color: C.green, fontWeight: 700, marginLeft: "auto" }}>{sessions.reduce((a, s) => a + s.results.length * 2, 0)} rows across {sessions.length} session{sessions.length !== 1 ? "s" : ""}</span>
                   </div>
-
-                  <div style={{ ...S.card }}>
+                  <div style={S.card}>
                     <div style={{ overflowX: "auto", maxHeight: 520, overflowY: "auto" }}>
                       <table style={{ borderCollapse: "collapse", fontSize: 10 }}>
                         <thead style={{ position: "sticky", top: 0, zIndex: 2 }}>
@@ -860,15 +834,15 @@ export default function CompareIQ() {
                             <th style={{ ...S.th, background: C.headerBg, color: "#fff", minWidth: 80 }}>Status</th>
                             <th style={{ ...S.th, background: C.headerBg, color: "#fff", minWidth: 120 }}>Source</th>
                             <th style={{ ...S.th, background: C.headerBg, color: "#fff", minWidth: 160 }}>Composite Key</th>
-                            {sharedCols.map(c => (
-                              <th key={c} style={{ ...S.th, background: C.headerBg, color: "#CBD5E1", minWidth: 90 }}>{c}</th>
+                            {sharedCols.map(c => <th key={c} style={{ ...S.th, background: C.headerBg, color: "#CBD5E1", minWidth: 90 }}>{c}</th>)}
+                            {cMaps0.map(m => (
+                              <React.Fragment key={m.colA}>
+                                <th style={{ ...S.th, background: "#7F1D1D", color: "#FCA5A5", borderLeft: "2px solid #991B1B", minWidth: 100 }}>{m.colA}</th>
+                                <th style={{ ...S.th, background: "#7F1D1D", color: "#FCA5A5", minWidth: 120 }}>{m.colB} (USOPTE)</th>
+                                <th style={{ ...S.th, background: "#7F1D1D", color: "#FCA5A5", minWidth: 80 }}>Difference</th>
+                                <th style={{ ...S.th, background: "#7F1D1D", color: "#FCA5A5", borderRight: "2px solid #991B1B", minWidth: 140 }}>SK Comment</th>
+                              </React.Fragment>
                             ))}
-                            {cMaps0.map(m => [
-                              <th key={m.colA} style={{ ...S.th, background: "#7F1D1D", color: "#FCA5A5", borderLeft: "2px solid #991B1B", minWidth: 100 }}>{m.colA}</th>,
-                              <th key={m.colB+"u"} style={{ ...S.th, background: "#7F1D1D", color: "#FCA5A5", minWidth: 120 }}>{m.colB} (USOPTE)</th>,
-                              <th key={m.colA+"d"} style={{ ...S.th, background: "#7F1D1D", color: "#FCA5A5", minWidth: 80 }}>Difference</th>,
-                              <th key={m.colA+"c"} style={{ ...S.th, background: "#7F1D1D", color: "#FCA5A5", borderRight: "2px solid #991B1B", minWidth: 140 }}>SK Comment</th>,
-                            ])}
                           </tr>
                         </thead>
                         <tbody>
@@ -876,22 +850,17 @@ export default function CompareIQ() {
                             const kMaps = s.mappings.filter(m => m.isKey && m.colA && m.colB);
                             const sCmaps = s.mappings.filter(m => m.compare && !m.isKey && m.colA && m.colB);
                             const bMap = Object.fromEntries(s.mappings.filter(m => m.colA && m.colB).map(m => [m.colA, m.colB]));
-
                             return s.results.slice(0, 150).flatMap((r, ri) => {
                               const key = kMaps.map(m => r.keyVals[m.colA] ?? "").join("|");
                               const isMismatch = r.status !== "Matched";
                               const bgA = isMismatch ? "#FFF5F5" : ri % 2 === 0 ? C.surface : C.bg;
                               const bgB = isMismatch ? "#FFF0F0" : ri % 2 === 0 ? "#F5F8FF" : "#EFF4FF";
-
-                              // Row A
-                              const rowA = (
+                              return [
                                 <tr key={`${si}-${ri}-a`} style={{ background: bgA }}>
-                                  <td style={{ ...S.td }}><StatusBadge status={r.status} /></td>
+                                  <td style={S.td}><StatusBadge status={r.status} /></td>
                                   <td style={{ ...S.td, color: C.blue, fontWeight: 600 }}>{s.fileAName}</td>
                                   <td style={{ ...S.td, color: C.textMid, maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis" }}>{key}</td>
-                                  {sharedCols.map(c => (
-                                    <td key={c} style={{ ...S.td, color: C.textMid }}>{r.rowA ? (r.rowA[c] ?? "—") : "—"}</td>
-                                  ))}
+                                  {sharedCols.map(c => <td key={c} style={{ ...S.td, color: C.textMid }}>{r.rowA ? (r.rowA[c] ?? "—") : "—"}</td>)}
                                   {cMaps0.map(m => {
                                     const sc = sCmaps.find(x => x.colA === m.colA);
                                     const valA = sc && r.rowA ? (r.rowA[sc.colA] ?? "") : "";
@@ -900,42 +869,37 @@ export default function CompareIQ() {
                                     const diff = d?.diff || "";
                                     const isMis = d?.status === "Mismatched";
                                     const comment = makeComment(diff, valA, valB, r.status);
-                                    return [
-                                      <td key={m.colA} style={{ ...S.td, color: isMis ? C.red : C.blue, background: "#FFF8F8", borderLeft: "2px solid #FECACA", fontWeight: isMis ? 700 : 400 }}>{valA || "—"}</td>,
-                                      <td key={m.colB+"u"} style={{ ...S.td, color: C.textLight, background: "#FFF8F8" }}>—</td>,
-                                      <td key={m.colA+"d"} style={{ ...S.td, color: isMis ? C.red : C.textLight, fontWeight: isMis ? 700 : 400, background: "#FFF8F8" }}>{isMis ? diff : "—"}</td>,
-                                      <td key={m.colA+"c"} style={{ ...S.td, color: C.amber, fontStyle: "italic", background: "#FFF8F8", borderRight: "2px solid #FECACA" }}>{comment || "—"}</td>,
-                                    ];
+                                    return (
+                                      <React.Fragment key={m.colA}>
+                                        <td style={{ ...S.td, color: isMis ? C.red : C.blue, background: "#FFF8F8", borderLeft: "2px solid #FECACA", fontWeight: isMis ? 700 : 400 }}>{valA || "—"}</td>
+                                        <td style={{ ...S.td, color: C.textLight, background: "#FFF8F8" }}>—</td>
+                                        <td style={{ ...S.td, color: isMis ? C.red : C.textLight, fontWeight: isMis ? 700 : 400, background: "#FFF8F8" }}>{isMis ? diff : "—"}</td>
+                                        <td style={{ ...S.td, color: C.amber, fontStyle: "italic", background: "#FFF8F8", borderRight: "2px solid #FECACA" }}>{comment || "—"}</td>
+                                      </React.Fragment>
+                                    );
                                   })}
-                                </tr>
-                              );
-
-                              // Row B
-                              const rowB = (
+                                </tr>,
                                 <tr key={`${si}-${ri}-b`} style={{ background: bgB, borderBottom: `2px solid ${C.border}` }}>
                                   <td style={{ ...S.td, color: C.textLight }}></td>
                                   <td style={{ ...S.td, color: C.purple, fontWeight: 600 }}>{s.fileBName}</td>
-                                  <td style={{ ...S.td, color: C.textLight, maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis" }}>{key}</td>
-                                  {sharedCols.map(c => {
-                                    const cb = bMap[c] || c;
-                                    return <td key={c} style={{ ...S.td, color: C.textLight }}>{r.rowB ? (r.rowB[cb] ?? "—") : "—"}</td>;
-                                  })}
+                                  <td style={{ ...S.td, color: C.textLight }}>{key}</td>
+                                  {sharedCols.map(c => { const cb = bMap[c]||c; return <td key={c} style={{ ...S.td, color: C.textLight }}>{r.rowB ? (r.rowB[cb] ?? "—") : "—"}</td>; })}
                                   {cMaps0.map(m => {
                                     const sc = sCmaps.find(x => x.colA === m.colA);
                                     const valB = sc && r.rowB ? (r.rowB[sc.colB] ?? "") : "";
                                     const d = r.details?.find(d => d.colA === m.colA);
                                     const isMis = d?.status === "Mismatched";
-                                    return [
-                                      <td key={m.colA} style={{ ...S.td, color: C.textLight, background: "#FFF8F8", borderLeft: "2px solid #FECACA" }}>—</td>,
-                                      <td key={m.colB+"u"} style={{ ...S.td, color: isMis ? C.purple : C.purple, fontWeight: isMis ? 700 : 400, background: isMis ? "#F5E8FF" : "#FFF8F8" }}>{valB || "—"}</td>,
-                                      <td key={m.colA+"d"} style={{ ...S.td, color: C.textLight, background: "#FFF8F8" }}>—</td>,
-                                      <td key={m.colA+"c"} style={{ ...S.td, color: C.textLight, background: "#FFF8F8", borderRight: "2px solid #FECACA" }}>—</td>,
-                                    ];
+                                    return (
+                                      <React.Fragment key={m.colA}>
+                                        <td style={{ ...S.td, color: C.textLight, background: "#FFF8F8", borderLeft: "2px solid #FECACA" }}>—</td>
+                                        <td style={{ ...S.td, color: isMis ? C.purple : C.purple, fontWeight: isMis ? 700 : 400, background: isMis ? "#F5E8FF" : "#FFF8F8" }}>{valB || "—"}</td>
+                                        <td style={{ ...S.td, color: C.textLight, background: "#FFF8F8" }}>—</td>
+                                        <td style={{ ...S.td, color: C.textLight, background: "#FFF8F8", borderRight: "2px solid #FECACA" }}>—</td>
+                                      </React.Fragment>
+                                    );
                                   })}
                                 </tr>
-                              );
-
-                              return [rowA, rowB];
+                              ];
                             });
                           })}
                         </tbody>
@@ -948,7 +912,7 @@ export default function CompareIQ() {
                     </div>
                   </div>
                   <div style={{ marginTop: 8, fontSize: 10, color: C.textLight, textAlign: "center" }}>
-                    Row 1 per record = <b style={{ color: C.blue }}>File A</b> &nbsp;·&nbsp; Row 2 = <b style={{ color: C.purple }}>File B</b> &nbsp;·&nbsp; <b style={{ color: C.red }}>Red cols</b> = Current | Current USOPTE | Difference | SK Comment
+                    Row 1 = <b style={{ color: C.blue }}>File A</b> · Row 2 = <b style={{ color: C.purple }}>File B</b> · <b style={{ color: C.red }}>Red cols</b> = Current | USOPTE | Difference | SK Comment
                   </div>
                 </div>
               );
