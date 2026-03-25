@@ -151,10 +151,103 @@ function makeComment(diff, valA, valB, status) {
   return "Value mismatch";
 }
 
-// ─── Raw XLSX writer — fflate zip, no SheetJS write step ─────────────────────
+// ─── Raw XLSX writer — pure browser, zero external dependencies ──────────────
+// Builds a valid .xlsx (ZIP + XML) entirely in the browser.
+// No SheetJS, no fflate — just a minimal ZIP implementation.
 async function exportToExcel(sessions, allMappings) {
-  const fflate = await import("https://cdn.jsdelivr.net/npm/fflate@0.8.2/esm/browser.js");
 
+  // ── Minimal ZIP builder (store only, no compression) ──────────────────────
+  function makeZip(files) {
+    // files: array of { name: string, data: Uint8Array }
+    const enc = t => new TextEncoder().encode(t);
+    const u32 = n => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n, true); return b; };
+    const u16 = n => { const b = new Uint8Array(2); new DataView(b.buffer).setUint16(0, n, true); return b; };
+
+    // CRC32 table
+    const crcTable = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+      let c = i;
+      for (let j = 0; j < 8; j++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      crcTable[i] = c;
+    }
+    function crc32(data) {
+      let crc = 0xFFFFFFFF;
+      for (let i = 0; i < data.length; i++) crc = crcTable[(crc ^ data[i]) & 0xFF] ^ (crc >>> 8);
+      return (crc ^ 0xFFFFFFFF) >>> 0;
+    }
+
+    const localHeaders = [];
+    const centralDir = [];
+    let offset = 0;
+
+    for (const file of files) {
+      const nameBytes = enc(file.name);
+      const data = file.data;
+      const crc = crc32(data);
+      const size = data.length;
+
+      // Local file header
+      const lh = new Uint8Array([
+        0x50,0x4B,0x03,0x04, // signature
+        20,0,                 // version needed
+        0,0,                  // flags
+        0,0,                  // compression: store
+        0,0,0,0,              // mod time/date
+        ...u32(crc),
+        ...u32(size),
+        ...u32(size),
+        ...u16(nameBytes.length),
+        0,0,                  // extra field length
+        ...nameBytes,
+        ...data,
+      ]);
+
+      // Central directory entry
+      const cd = new Uint8Array([
+        0x50,0x4B,0x01,0x02, // signature
+        20,0,                 // version made by
+        20,0,                 // version needed
+        0,0,                  // flags
+        0,0,                  // compression: store
+        0,0,0,0,              // mod time/date
+        ...u32(crc),
+        ...u32(size),
+        ...u32(size),
+        ...u16(nameBytes.length),
+        0,0,                  // extra
+        0,0,                  // comment
+        0,0,                  // disk start
+        0,0,                  // internal attr
+        0,0,0,0,              // external attr
+        ...u32(offset),
+        ...nameBytes,
+      ]);
+
+      localHeaders.push(lh);
+      centralDir.push(cd);
+      offset += lh.length;
+    }
+
+    const cdSize = centralDir.reduce((s, b) => s + b.length, 0);
+    const eocd = new Uint8Array([
+      0x50,0x4B,0x05,0x06, // signature
+      0,0,0,0,              // disk numbers
+      ...u16(files.length),
+      ...u16(files.length),
+      ...u32(cdSize),
+      ...u32(offset),
+      0,0,                  // comment length
+    ]);
+
+    const parts = [...localHeaders, ...centralDir, eocd];
+    const total = parts.reduce((s, b) => s + b.length, 0);
+    const out = new Uint8Array(total);
+    let pos = 0;
+    for (const p of parts) { out.set(p, pos); pos += p.length; }
+    return out;
+  }
+
+  // ── Data setup ────────────────────────────────────────────────────────────
   const s0 = sessions[0];
   const cMaps0 = s0.mappings.filter(m => m.compare && !m.isKey && m.colA && m.colB);
   const firstRowA = s0.results.find(r => r.rowA)?.rowA || {};
@@ -162,8 +255,6 @@ async function exportToExcel(sessions, allMappings) {
   const compareColsSet = new Set(cMaps0.map(m => m.colA));
   const sharedCols = allColsA.filter(c => !compareColsSet.has(c));
 
-  // Header: Status | Source | Composite Key | PSU Name | TRU Name | ... | Current | Current USOPTE | Difference | SK Comment
-  // Plain column names — no (A)/(B) suffixes
   const compHeader = [
     "Status", "Source", "Composite Key",
     ...sharedCols,
@@ -176,11 +267,8 @@ async function exportToExcel(sessions, allMappings) {
       const kMaps = s.mappings.filter(m => m.isKey && m.colA && m.colB);
       const sCmaps = s.mappings.filter(m => m.compare && !m.isKey && m.colA && m.colB);
       const bMap = Object.fromEntries(s.mappings.filter(m => m.colA && m.colB).map(m => [m.colA, m.colB]));
-
       for (const r of s.results.filter(filterFn || (() => true))) {
         const key = kMaps.map(m => r.keyVals[m.colA] ?? "").join("|");
-
-        // File A row: shared cols from rowA, Current filled, USOPTE/Diff/Comment filled
         const sharedA = sharedCols.map(c => r.rowA ? (r.rowA[c] ?? "") : "");
         const compareA = cMaps0.flatMap(m => {
           const sc = sCmaps.find(x => x.colA === m.colA);
@@ -193,14 +281,8 @@ async function exportToExcel(sessions, allMappings) {
           return [valA, valB, diff, comment];
         });
         rows.push([r.status, s.fileAName, key, ...sharedA, ...compareA]);
-
-        // File B row: shared cols from rowB, all compare cols blank (already shown on row A)
-        const sharedB = sharedCols.map(c => {
-          const cb = bMap[c] || c;
-          return r.rowB ? (r.rowB[cb] ?? "") : "";
-        });
-        const compareB = cMaps0.flatMap(() => ["", "", "", ""]);
-        rows.push([r.status, s.fileBName, key, ...sharedB, ...compareB]);
+        const sharedB = sharedCols.map(c => { const cb = bMap[c]||c; return r.rowB ? (r.rowB[cb] ?? "") : ""; });
+        rows.push([r.status, s.fileBName, key, ...sharedB, ...cMaps0.flatMap(() => ["","","",""])]);
       }
     }
     return rows;
@@ -208,30 +290,28 @@ async function exportToExcel(sessions, allMappings) {
 
   const compRows = buildRows(null);
   const diffRows = buildRows(r => r.status !== "Matched");
-
-  // ── SHEET 3: Summary ──
   const summaryRows = [
     ["CompareIQ — Comparison Summary"], [],
-    ["Session #", "File A", "File B", "Total A", "Total B", "Matched", "Mismatched", "Only in A", "Only in B", "Duplicates", "Match Rate"],
-    ...sessions.map((s, i) => [i+1, s.fileAName, s.fileBName, s.totalA, s.totalB, s.matched, s.mismatched, s.onlyA, s.onlyB, s.duplicates, `${((s.matched/(s.matched+s.mismatched||1))*100).toFixed(1)}%`])
+    ["Session #","File A","File B","Total A","Total B","Matched","Mismatched","Only in A","Only in B","Duplicates","Match Rate"],
+    ...sessions.map((s,i)=>[i+1,s.fileAName,s.fileBName,s.totalA,s.totalB,s.matched,s.mismatched,s.onlyA,s.onlyB,s.duplicates,`${((s.matched/(s.matched+s.mismatched||1))*100).toFixed(1)}%`])
   ];
 
-  // ── XML helpers ──
-  const esc = s => String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&apos;");
+  // ── XML helpers ───────────────────────────────────────────────────────────
+  const esc = s => String(s??"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&apos;");
   const colName = n => { let s=""; for(;n>=0;n=Math.floor(n/26)-1) s=String.fromCharCode(65+n%26)+s; return s; };
+  const enc = s => new TextEncoder().encode(s);
 
   const buildSheetXML = rows => {
     const parts = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>'];
     for (let ri = 0; ri < rows.length; ri++) {
       parts.push(`<row r="${ri+1}">`);
-      const row = rows[ri];
-      for (let ci = 0; ci < row.length; ci++) {
-        const val = row[ci];
-        const addr = colName(ci) + (ri+1);
-        const s = String(val ?? "");
-        const isNum = s !== "" && !isNaN(Number(s));
+      for (let ci = 0; ci < rows[ri].length; ci++) {
+        const val = rows[ri][ci];
+        const addr = colName(ci)+(ri+1);
+        const s = String(val??"");
+        const isNum = s !== "" && !isNaN(Number(s)) && s.trim() !== "";
         parts.push(isNum
-          ? `<c r="${addr}"><v>${Number(s)}</v></c>`
+          ? `<c r="${addr}"><v>${s}</v></c>`
           : `<c r="${addr}" t="inlineStr"><is><t>${esc(val)}</t></is></c>`);
       }
       parts.push("</row>");
@@ -240,12 +320,10 @@ async function exportToExcel(sessions, allMappings) {
     return parts.join("");
   };
 
-  const enc = new TextEncoder();
-  const toBytes = s => enc.encode(s);
   const sheets = [
-    { name: "Summary", rows: summaryRows },
-    { name: "Comparison Results", rows: compRows },
-    { name: "Difference Mismatch", rows: diffRows },
+    { name: "Summary",            rows: summaryRows },
+    { name: "Comparison Results", rows: compRows    },
+    { name: "Difference Mismatch",rows: diffRows    },
   ];
 
   const workbookXML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>${sheets.map((s,i)=>`<sheet name="${esc(s.name)}" sheetId="${i+1}" r:id="rId${i+1}"/>`).join("")}</sheets></workbook>`;
@@ -253,17 +331,15 @@ async function exportToExcel(sessions, allMappings) {
   const contentTypes = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>${sheets.map((s,i)=>`<Override PartName="/xl/worksheets/sheet${i+1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join("")}</Types>`;
   const rootRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`;
 
-  const zipFiles = {
-    "[Content_Types].xml": toBytes(contentTypes),
-    "_rels/.rels": toBytes(rootRels),
-    "xl/workbook.xml": toBytes(workbookXML),
-    "xl/_rels/workbook.xml.rels": toBytes(workbookRels),
-  };
-  for (let i = 0; i < sheets.length; i++) {
-    zipFiles[`xl/worksheets/sheet${i+1}.xml`] = toBytes(buildSheetXML(sheets[i].rows));
-  }
+  const zipFiles = [
+    { name: "[Content_Types].xml",          data: enc(contentTypes) },
+    { name: "_rels/.rels",                  data: enc(rootRels) },
+    { name: "xl/workbook.xml",              data: enc(workbookXML) },
+    { name: "xl/_rels/workbook.xml.rels",   data: enc(workbookRels) },
+    ...sheets.map((s,i) => ({ name: `xl/worksheets/sheet${i+1}.xml`, data: enc(buildSheetXML(s.rows)) })),
+  ];
 
-  const zipped = fflate.zipSync(zipFiles, { level: 0 });
+  const zipped = makeZip(zipFiles);
   const blob = new Blob([zipped], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
