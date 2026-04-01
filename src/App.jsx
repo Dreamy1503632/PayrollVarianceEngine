@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, Fragment } from "react";
 
 // ─── Parsers ─────────────────────────────────────────────────────────────────
 function parseCSV(text) {
@@ -141,17 +141,20 @@ function compareDatasets(dataA, dataB, mappings, tolerance) {
   return { results, duplicatesA: Object.values(kc).filter(c => c > 1).reduce((s, c) => s + c - 1, 0) };
 }
 
-// ─── Comment helper ──────────────────────────────────────────────────────────
+// ─── Comment helper (matches SK USOPTE reference) ────────────────────────────
 function makeComment(diff, valA, valB, status) {
   if (status === "Only in A") return "Only in File A";
   if (status === "Only in B") return "Only in File B";
   if (!diff || diff === "0.0000") return "";
   const num = parseFloat(diff);
-  if (!isNaN(num)) return Math.abs(num) < 1 ? "Less than $1 difference" : `Difference: ${diff}`;
+  if (!isNaN(num)) {
+    if (Math.abs(num) < 1) return "Less than $1 difference";
+    return `More $ Difference`;
+  }
   return "Value mismatch";
 }
 
-// ─── Raw XLSX writer — no SheetJS, no .join(""), streams row-by-row to Uint8Array ──
+// ─── Raw XLSX writer with styling — no SheetJS, streams row-by-row to Uint8Array ──
 async function exportToExcel(sessions) {
   const fflate = await import("https://cdn.jsdelivr.net/npm/fflate@0.8.2/esm/browser.js");
   const enc = new TextEncoder();
@@ -162,30 +165,30 @@ async function exportToExcel(sessions) {
   const allColsA = Object.keys(firstRowA);
   const compareColsSet = new Set(cMaps0.map(m => m.colA));
   const diffNonCompareCols = allColsA.filter(c => !compareColsSet.has(c));
-  const diffExtraCols = cMaps0.flatMap(m => [m.colA, `${m.colB} (USOPTE)`, "Difference", "SK Comment"]);
 
-  // XML escape
+  // XML helpers
   const esc = s => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
-
-  // Column letter from index
   const colName = n => { let s = ""; for (; n >= 0; n = Math.floor(n / 26) - 1) s = String.fromCharCode(65 + n % 26) + s; return s; };
 
-  // ── KEY: encode each row to Uint8Array immediately — never accumulate a large string ──
-  const rowToBytes = (row, ri) => {
+  // Encode one row to Uint8Array — never accumulate large strings
+  // styleIdx: 0=normal, 1=header, 2=mismatch-highlight, 3=only-in-A, 4=only-in-B
+  const rowToBytes = (row, ri, styleIdx) => {
     let s = `<row r="${ri + 1}">`;
     for (let ci = 0; ci < row.length; ci++) {
       const val = row[ci];
       const addr = colName(ci) + (ri + 1);
+      const si = styleIdx || 0;
       const isNum = val !== "" && val !== null && val !== undefined && !isNaN(Number(val)) && String(val).trim() !== "" && typeof val !== "boolean";
-      s += isNum
-        ? `<c r="${addr}" t="n"><v>${Number(val)}</v></c>`
-        : `<c r="${addr}" t="inlineStr"><is><t>${esc(val)}</t></is></c>`;
+      if (isNum) {
+        s += `<c r="${addr}" s="${si}" t="n"><v>${Number(val)}</v></c>`;
+      } else {
+        s += `<c r="${addr}" s="${si}" t="inlineStr"><is><t>${esc(val)}</t></is></c>`;
+      }
     }
     s += "</row>";
     return enc.encode(s);
   };
 
-  // Concat array of Uint8Arrays into one (no spread operator)
   const concatParts = (parts) => {
     let total = 0;
     for (let i = 0; i < parts.length; i++) total += parts[i].length;
@@ -195,95 +198,150 @@ async function exportToExcel(sessions) {
     return out;
   };
 
-  // Build sheet as array of small Uint8Arrays, then concat once
-  const buildSheetBytes = (rows) => {
+  // Build sheet with per-row style indices
+  // rows = array of { cells: [...], style: 0|1|2|3|4 }
+  const buildSheetBytes = (styledRows) => {
     const parts = [enc.encode('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>')];
-    for (let ri = 0; ri < rows.length; ri++) {
-      parts.push(rowToBytes(rows[ri], ri));
+    for (let ri = 0; ri < styledRows.length; ri++) {
+      parts.push(rowToBytes(styledRows[ri].cells, ri, styledRows[ri].style));
     }
     parts.push(enc.encode("</sheetData></worksheet>"));
     return concatParts(parts);
   };
 
-  // ── Build row data — only non-matched rows (matched = 163k rows = too large) ──
+  // ── Build non-matched results ──
   const nonMatchedResults = sessions.flatMap(s =>
     s.results.filter(r => r.status !== "Matched").map(r => ({ r, s }))
   );
 
-  // Sheet 1: Comparison Results (2 rows per non-matched record)
+  // ── Sheet: Comparison Results (2 rows per record, like SK reference) ──
   const compCols = ["Status", "Source", "Composite Key", ...allColsA];
-  const compRows = [compCols];
+  const compStyledRows = [{ cells: compCols, style: 1 }];
   for (const { r, s } of nonMatchedResults) {
     const kMaps = s.mappings.filter(m => m.isKey && m.colA && m.colB);
     const bMap = Object.fromEntries(s.mappings.filter(m => m.colA && m.colB).map(m => [m.colA, m.colB]));
     const key = kMaps.map(m => r.keyVals[m.colA] ?? "").join("|");
-    compRows.push([r.status, s.fileAName, key, ...allColsA.map(c => r.rowA ? (r.rowA[c] ?? "") : "")]);
-    compRows.push([r.status, s.fileBName, key, ...allColsA.map(c => { const cb = bMap[c]; return r.rowB && cb ? (r.rowB[cb] ?? "") : ""; })]);
+    const st = r.status === "Mismatched" ? 2 : r.status === "Only in A" ? 3 : r.status === "Only in B" ? 4 : 0;
+    compStyledRows.push({ cells: [r.status, s.fileAName, key, ...allColsA.map(c => r.rowA ? (r.rowA[c] ?? "") : "")], style: st });
+    compStyledRows.push({ cells: [r.status, s.fileBName, key, ...allColsA.map(c => { const cb = bMap[c]; return r.rowB && cb ? (r.rowB[cb] ?? "") : ""; })], style: st });
   }
 
-  // Sheet 2: Difference Mismatch
+  // ── Sheet: Difference Mismatch (matches SK USOPTE reference format exactly) ──
+  // Columns: Status | Source | Composite Key | <shared non-compare cols> | then for each compare col: ColName | ColName (USOPTE) | Difference | SK Comment
+  const diffExtraCols = cMaps0.flatMap(m => [m.colA, `${m.colA} (USOPTE)`, "Difference", "SK Comment"]);
   const diffCols = ["Status", "Source", "Composite Key", ...diffNonCompareCols, ...diffExtraCols];
-  const diffRows = [diffCols];
+  const diffStyledRows = [{ cells: diffCols, style: 1 }];
+
   for (const { r, s } of nonMatchedResults) {
     const kMaps = s.mappings.filter(m => m.isKey && m.colA && m.colB);
     const sCmaps = s.mappings.filter(m => m.compare && !m.isKey && m.colA && m.colB);
     const bMapFull = Object.fromEntries(s.mappings.filter(m => m.colA && m.colB).map(m => [m.colA, m.colB]));
     const key = kMaps.map(m => r.keyVals[m.colA] ?? "").join("|");
-    const sharedVals = diffNonCompareCols.map(c => {
+    const st = r.status === "Mismatched" ? 2 : r.status === "Only in A" ? 3 : r.status === "Only in B" ? 4 : 0;
+
+    // Row 1 (File A): shared cols from best available, Current filled, USOPTE blank, Diff + Comment filled
+    const sharedValsA = diffNonCompareCols.map(c => {
+      if (r.rowA) return r.rowA[c] ?? "";
       const cb = bMapFull[c];
-      return r.rowB && cb ? (r.rowB[cb] ?? "") : (r.rowA ? (r.rowA[c] ?? "") : "");
+      return r.rowB && cb ? (r.rowB[cb] ?? "") : "";
     });
-    const compareVals = cMaps0.flatMap(m => {
+    const compareValsRowA = cMaps0.flatMap(m => {
       const sc = sCmaps.find(x => x.colA === m.colA);
       const valA = sc && r.rowA ? (r.rowA[sc.colA] ?? "") : "";
       const valB = sc && r.rowB ? (r.rowB[sc.colB] ?? "") : "";
-      const d = r.details?.find(d => d.colA === m.colA);
+      const d = r.details?.find(dd => dd.colA === m.colA);
       const diff = d?.diff || "";
-      return [valA, valB, diff ? (parseFloat(diff) || diff) : "", makeComment(diff, valA, valB, r.status)];
+      const comment = makeComment(diff, valA, valB, r.status);
+      // Current = valA, Current (USOPTE) = blank, Difference = diff, SK Comment = comment
+      return [valA, "", diff ? (parseFloat(diff) || diff) : "", comment];
     });
-    diffRows.push([r.status, s.fileBName, key, ...sharedVals, ...compareVals]);
+    diffStyledRows.push({ cells: [r.status, s.fileAName, key, ...sharedValsA, ...compareValsRowA], style: st });
+
+    // Row 2 (File B): shared cols from B, Current blank, USOPTE filled, Diff blank, Comment blank
+    const sharedValsB = diffNonCompareCols.map(c => {
+      const cb = bMapFull[c];
+      return r.rowB && cb ? (r.rowB[cb] ?? "") : "";
+    });
+    const compareValsRowB = cMaps0.flatMap(m => {
+      const sc = sCmaps.find(x => x.colA === m.colA);
+      const valB = sc && r.rowB ? (r.rowB[sc.colB] ?? "") : "";
+      // Current = blank, Current (USOPTE) = valB, Difference = blank, SK Comment = blank
+      return ["", valB, "", ""];
+    });
+    diffStyledRows.push({ cells: [r.status, s.fileBName, key, ...sharedValsB, ...compareValsRowB], style: st });
   }
 
-  // Sheet 3: Summary
-  const summaryRows = [
-    ["CompareIQ — Comparison Summary"], [],
-    ["Session #", "File A", "File B", "Total A", "Total B", "Matched", "Mismatched", "Only in A", "Only in B", "Duplicates", "Match Rate"],
-    ...sessions.map((s, i) => [
-      i + 1, s.fileAName, s.fileBName, s.totalA, s.totalB,
-      s.matched, s.mismatched, s.onlyA, s.onlyB, s.duplicates,
-      `${((s.matched / (s.matched + s.mismatched || 1)) * 100).toFixed(1)}%`
-    ])
+  // ── Sheet: Summary ──
+  const summaryStyledRows = [
+    { cells: ["CompareIQ — Comparison Summary"], style: 1 },
+    { cells: [], style: 0 },
+    { cells: ["Session #", "File A", "File B", "Total A", "Total B", "Matched", "Mismatched", "Only in A", "Only in B", "Duplicates", "Match Rate"], style: 1 },
+    ...sessions.map((s, i) => ({
+      cells: [i + 1, s.fileAName, s.fileBName, s.totalA, s.totalB, s.matched, s.mismatched, s.onlyA, s.onlyB, s.duplicates, `${((s.matched / (s.matched + s.mismatched || 1)) * 100).toFixed(1)}%`],
+      style: 0
+    }))
   ];
 
   const toBytes = s => enc.encode(s);
 
   const sheets = [
-    { name: "Summary", rows: summaryRows },
-    { name: "Comparison Results", rows: compRows },
-    { name: "Difference Mismatch", rows: diffRows },
+    { name: "Summary", data: summaryStyledRows },
+    { name: "Comparison Results", data: compStyledRows },
+    { name: "Difference Mismatch", data: diffStyledRows },
   ];
 
-  // ── Standard XLSX boilerplate ──
+  // ── Styles XML (cell formatting with colors) ──
+  const stylesXML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts count="3">
+    <font><sz val="11"/><name val="Calibri"/></font>
+    <font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font>
+    <font><b/><sz val="11"/><name val="Calibri"/></font>
+  </fonts>
+  <fills count="7">
+    <fill><patternFill patternType="none"/></fill>
+    <fill><patternFill patternType="gray125"/></fill>
+    <fill><patternFill patternType="solid"><fgColor rgb="FF1A2332"/></patternFill></fill>
+    <fill><patternFill patternType="solid"><fgColor rgb="FFFEF2F2"/></patternFill></fill>
+    <fill><patternFill patternType="solid"><fgColor rgb="FFFFFBEB"/></patternFill></fill>
+    <fill><patternFill patternType="solid"><fgColor rgb="FFF5F3FF"/></patternFill></fill>
+    <fill><patternFill patternType="solid"><fgColor rgb="FFECFDF5"/></patternFill></fill>
+  </fills>
+  <borders count="2">
+    <border><left/><right/><top/><bottom/><diagonal/></border>
+    <border><left style="thin"><color auto="1"/></left><right style="thin"><color auto="1"/></right><top style="thin"><color auto="1"/></top><bottom style="thin"><color auto="1"/></bottom><diagonal/></border>
+  </borders>
+  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+  <cellXfs count="5">
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1"/>
+    <xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1"/>
+    <xf numFmtId="0" fontId="0" fillId="3" borderId="1" xfId="0" applyFill="1" applyBorder="1"/>
+    <xf numFmtId="0" fontId="0" fillId="4" borderId="1" xfId="0" applyFill="1" applyBorder="1"/>
+    <xf numFmtId="0" fontId="0" fillId="5" borderId="1" xfId="0" applyFill="1" applyBorder="1"/>
+  </cellXfs>
+</styleSheet>`;
+
+  // ── XLSX boilerplate ──
   const workbookXML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>${sheets.map((s, i) => `<sheet name="${esc(s.name)}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join("")}</sheets></workbook>`;
 
-  const workbookRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${sheets.map((s, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`).join("")}</Relationships>`;
+  const workbookRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${sheets.map((s, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`).join("")}<Relationship Id="rId${sheets.length + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`;
 
-  const contentTypes = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>${sheets.map((s, i) => `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join("")}</Types>`;
+  const contentTypes = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>${sheets.map((s, i) => `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join("")}</Types>`;
 
   const rootRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`;
 
-  // ── Assemble ZIP — each sheet is built as Uint8Array, never as a string ──
+  // ── Assemble ZIP ──
   const zipFiles = {
     "[Content_Types].xml": toBytes(contentTypes),
     "_rels/.rels": toBytes(rootRels),
     "xl/workbook.xml": toBytes(workbookXML),
     "xl/_rels/workbook.xml.rels": toBytes(workbookRels),
+    "xl/styles.xml": toBytes(stylesXML),
   };
   for (let i = 0; i < sheets.length; i++) {
-    zipFiles[`xl/worksheets/sheet${i + 1}.xml`] = buildSheetBytes(sheets[i].rows);
+    zipFiles[`xl/worksheets/sheet${i + 1}.xml`] = buildSheetBytes(sheets[i].data);
   }
 
-  // ZIP with level:0 (no compression = fast, Excel opens fine)
   const zipped = fflate.zipSync(zipFiles, { level: 0 });
   const blob = new Blob([zipped], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
   const url = URL.createObjectURL(blob);
@@ -369,7 +427,6 @@ export default function CompareIQ() {
   };
 
   const updateMapping = (i, field, val) => setMappings(p => p.map((m, idx) => idx === i ? { ...m, [field]: val } : m));
-
   const setAllCompare = (val) => setMappings(p => p.map(m => m.isKey ? m : { ...m, compare: val }));
   const allCompareOn = mappings.filter(m => !m.isKey).every(m => m.compare);
   const anyCompareOn = mappings.filter(m => !m.isKey).some(m => m.compare);
@@ -412,477 +469,4 @@ export default function CompareIQ() {
         onDragOver={e => { e.preventDefault(); setDrag(true); }}
         onDragLeave={() => setDrag(false)}
         onDrop={e => { e.preventDefault(); setDrag(false); if (e.dataTransfer.files[0]) onFile(e.dataTransfer.files[0]); }}
-        style={{ border: `2px dashed ${drag ? color : file ? C.green : C.border}`, borderRadius: 12, padding: "22px 16px", textAlign: "center", cursor: "pointer", background: drag ? `${color}08` : file ? C.greenLight : C.bg, transition: "all .2s" }}>
-        <input ref={ref} type="file" accept=".csv,.xlsx,.xls,.txt,.tsv,.pdf,.tex" style={{ display: "none" }} onChange={e => { if (e.target.files[0]) onFile(e.target.files[0]); }} />
-        <div style={{ fontSize: 26, marginBottom: 6 }}>{file ? "✅" : "📂"}</div>
-        <div style={{ fontWeight: 700, color: file ? C.green : C.textMid, fontSize: 13 }}>{file ? file.name : label}</div>
-        {file ? <div style={{ color: C.textLight, fontSize: 11, marginTop: 3 }}>{(file.size / 1024).toFixed(1)} KB · click to replace</div>
-          : <div style={{ color: C.textLight, fontSize: 11, marginTop: 5 }}>CSV · Excel · TXT · TSV · PDF · TeX</div>}
-      </div>
-    );
-  };
-
-  const Radio = ({ checked, onChange, color = C.amber }) => (
-    <div onClick={onChange} style={{ width: 17, height: 17, borderRadius: "50%", border: `2px solid ${checked ? color : C.borderStrong}`, background: checked ? color : "#fff", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", margin: "auto", transition: "all .15s", flexShrink: 0 }}>
-      {checked && <div style={{ width: 6, height: 6, borderRadius: "50%", background: "#fff" }} />}
-    </div>
-  );
-
-  const Checkbox = ({ checked, onChange, color = C.blue }) => (
-    <div onClick={onChange} style={{ width: 17, height: 17, borderRadius: 4, border: `2px solid ${checked ? color : C.borderStrong}`, background: checked ? color : "#fff", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", margin: "auto", transition: "all .15s", flexShrink: 0 }}>
-      {checked && <span style={{ color: "#fff", fontSize: 11, fontWeight: 900, lineHeight: 1 }}>✓</span>}
-    </div>
-  );
-
-  const ColSelect = ({ value, options, onChange, color }) => (
-    <div style={{ position: "relative", flex: 1 }}>
-      <select value={value} onChange={e => onChange(e.target.value)}
-        style={{ ...S.input, width: "100%", paddingRight: 24, appearance: "none", cursor: "pointer", borderColor: value ? `${color}55` : C.border }}>
-        <option value="">— not mapped —</option>
-        {options.map(o => <option key={o}>{o}</option>)}
-      </select>
-      <span style={{ position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)", color: C.textLight, pointerEvents: "none", fontSize: 10 }}>▾</span>
-    </div>
-  );
-
-  return (
-    <div style={{ minHeight: "100vh", background: C.bg, color: C.text, fontFamily: "'Inter','Segoe UI',sans-serif" }}>
-      <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-
-      {/* ── Header ── */}
-      <div style={{ background: C.headerBg, padding: "12px 28px", display: "flex", alignItems: "center", justifyContent: "space-between", position: "sticky", top: 0, zIndex: 50, boxShadow: "0 2px 8px rgba(0,0,0,0.15)" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <div style={{ width: 32, height: 32, borderRadius: 8, background: "linear-gradient(135deg,#3B82F6,#7C3AED)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16 }}>⚖️</div>
-          <div>
-            <div style={{ fontWeight: 800, fontSize: 16, color: "#fff", letterSpacing: 0.3 }}>CompareIQ</div>
-            <div style={{ fontSize: 9, color: "#94A3B8", letterSpacing: 1.5 }}>INTELLIGENT DATASET COMPARISON</div>
-          </div>
-        </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-          {STEPS.map((s, i) => (
-            <div key={s} style={{ display: "flex", alignItems: "center", gap: 3 }}>
-              <div onClick={() => step > i && setStep(i)} style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 12px", borderRadius: 20, background: step === i ? "#3B82F6" : step > i ? "#1E40AF" : "transparent", border: `1px solid ${step === i ? "#3B82F6" : step > i ? "#3B82F6" : "#475569"}`, color: step >= i ? "#fff" : "#94A3B8", fontSize: 11, fontWeight: 600, cursor: step > i ? "pointer" : "default" }}>
-                <div style={{ width: 14, height: 14, borderRadius: "50%", background: step > i ? "#22C55E" : step === i ? "#fff" : "#475569", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 8, color: step === i ? "#3B82F6" : "#fff", fontWeight: 900 }}>{step > i ? "✓" : i + 1}</div>
-                {s}
-              </div>
-              {i < STEPS.length - 1 && <div style={{ width: 14, height: 1, background: "#475569" }} />}
-            </div>
-          ))}
-          {sessions.length > 0 && <div style={{ marginLeft: 12, padding: "4px 10px", background: "#14532D", border: "1px solid #22C55E55", borderRadius: 20, fontSize: 10, color: "#22C55E" }}>{sessions.length} session{sessions.length > 1 ? "s" : ""}</div>}
-        </div>
-      </div>
-
-      <div style={{ maxWidth: 1100, margin: "0 auto", padding: "28px 20px" }}>
-        {error && <div style={{ background: C.redLight, border: `1px solid ${C.red}33`, color: C.red, borderRadius: 9, padding: "9px 14px", marginBottom: 14, fontSize: 12, display: "flex", justifyContent: "space-between", alignItems: "center" }}>⚠️ {error}<button onClick={() => setError("")} style={{ background: "none", border: "none", color: C.red, cursor: "pointer", fontSize: 16, lineHeight: 1 }}>×</button></div>}
-        {loading && <div style={{ background: C.blueLight, border: `1px solid ${C.blue}33`, borderRadius: 9, padding: "9px 14px", marginBottom: 14, fontSize: 12, color: C.blue }}>⏳ Processing…</div>}
-        {exporting && <div style={{ background: C.amberLight, border: `1px solid ${C.amber}33`, borderRadius: 9, padding: "9px 14px", marginBottom: 14, fontSize: 12, color: C.amber, fontWeight: 600 }}>⏳ Building Excel file — writing {sessions.reduce((a, s) => a + s.results.filter(r => r.status !== "Matched").length, 0).toLocaleString()} non-matched records to XLSX…</div>}
-
-        {/* ══ STEP 0 — UPLOAD ══ */}
-        {step === 0 && (
-          <div>
-            <div style={{ textAlign: "center", marginBottom: 28 }}>
-              <h1 style={{ fontWeight: 800, fontSize: 28, margin: "0 0 6px", color: C.text }}>Upload Your Datasets</h1>
-              <p style={{ color: C.textLight, margin: 0, fontSize: 13 }}>CSV · Excel · TXT · TSV · PDF · TeX · Pipe-delimited</p>
-            </div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 24 }}>
-              {[
-                { label: "Drop Dataset A — Source / HR / Expected", which: "A", file: fileA, data: dataA, headers: headersA, color: C.blue },
-                { label: "Drop Dataset B — Target / Payroll / Actual", which: "B", file: fileB, data: dataB, headers: headersB, color: C.purple }
-              ].map(({ label, which, file, data, headers, color }) => (
-                <div key={which}>
-                  <div style={{ ...S.label, marginBottom: 8, color }}>● DATASET {which}</div>
-                  <DropZone label={label} file={file} color={color} onFile={f => handleFile(f, which)} />
-                  {data.length > 0 && (
-                    <div style={{ marginTop: 8, ...S.card, padding: 12 }}>
-                      <div style={{ color, fontSize: 11, fontWeight: 700, marginBottom: 6 }}>{data.length} rows · {headers.length} columns</div>
-                      <div style={{ overflowX: "auto" }}>
-                        <table style={{ borderCollapse: "collapse", fontSize: 10 }}>
-                          <thead><tr>{headers.slice(0, 7).map(h => <th key={h} style={{ padding: "3px 8px", background: "#F0F4FA", color: C.textMid, textAlign: "left", whiteSpace: "nowrap", fontWeight: 600 }}>{h}</th>)}{headers.length > 7 && <th style={{ color: C.textLight, padding: "3px 6px" }}>+{headers.length - 7}</th>}</tr></thead>
-                          <tbody>{data.slice(0, 2).map((r, i) => <tr key={i}>{headers.slice(0, 7).map(h => <td key={h} style={{ padding: "3px 8px", color: C.textMid, whiteSpace: "nowrap" }}>{r[h]}</td>)}</tr>)}</tbody>
-                        </table>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-            <div style={{ textAlign: "center" }}>
-              <button onClick={proceedToMap} disabled={!dataA.length || !dataB.length} style={{ ...S.btnPrimary, opacity: dataA.length && dataB.length ? 1 : 0.4 }}>
-                Continue to Column Mapping →
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* ══ STEP 1 — COLUMN MAPPING ══ */}
-        {step === 1 && (
-          <div>
-            <div style={{ marginBottom: 18 }}>
-              <h1 style={{ fontWeight: 800, fontSize: 22, margin: "0 0 4px" }}>Column Mapping Configuration</h1>
-              <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 8, flexWrap: "wrap" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "4px 12px", background: C.blueLight, border: `1px solid ${C.blue}33`, borderRadius: 20, fontSize: 11 }}>
-                  <span style={{ color: C.blue }}>●</span><span style={{ color: C.blue, fontWeight: 600 }}>{fileA?.name}</span>
-                </div>
-                <span style={{ color: C.textLight, fontSize: 16 }}>⇌</span>
-                <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "4px 12px", background: C.purpleLight, border: `1px solid ${C.purple}33`, borderRadius: 20, fontSize: 11 }}>
-                  <span style={{ color: C.purple }}>●</span><span style={{ color: C.purple, fontWeight: 600 }}>{fileB?.name}</span>
-                </div>
-                <div style={{ flex: 1 }} />
-                <span style={{ fontSize: 11, color: C.textLight }}>Total: <b style={{ color: C.blue }}>{mappings.length}</b></span>
-                <span style={{ fontSize: 11, color: C.textLight }}>Keys: <b style={{ color: C.amber }}>{mappings.filter(m => m.isKey).length}</b></span>
-                <span style={{ fontSize: 11, color: C.textLight }}>Compare: <b style={{ color: C.green }}>{mappings.filter(m => m.compare && !m.isKey).length}</b></span>
-              </div>
-            </div>
-
-            <div style={{ background: C.blueLight, border: `1px solid ${C.blue}22`, borderRadius: 9, padding: "10px 14px", marginBottom: 14, fontSize: 12, color: C.textMid, display: "flex", alignItems: "center", gap: 8 }}>
-              <span style={{ color: C.blue, fontSize: 16 }}>ℹ</span>
-              Map columns, set <b style={{ color: C.amber }}>Key</b> columns for row matching, toggle <b style={{ color: C.green }}>Compare</b> for value comparison.
-            </div>
-
-            <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 10, padding: "10px 14px", ...S.card, boxShadow: "none" }}>
-              <span style={{ ...S.label }}>⚙ GLOBAL TOLERANCE</span>
-              <input type="number" min="0" max="100" step="0.1" value={tolerance} onChange={e => setTolerance(e.target.value)}
-                style={{ ...S.input, width: 60, textAlign: "center", borderColor: C.green, color: C.green, fontWeight: 700, fontSize: 14 }} />
-              <span style={{ color: C.green, fontWeight: 700 }}>%</span>
-              <span style={{ fontSize: 11, color: C.textLight }}>Acceptable numeric variance</span>
-              <div style={{ flex: 1 }} />
-              <button onClick={() => setMappings(p => [...p, { colA: headersA[0] || "", colB: headersB[0] || "", isKey: false, compare: true, ignoreCase: false }])}
-                style={{ ...S.btn(false), fontSize: 12, fontWeight: 700 }}>+ Add Row</button>
-            </div>
-
-            <div style={{ ...S.card, marginBottom: 16 }}>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 64px 80px 96px 32px", background: "#F0F4FA", padding: "8px 14px", borderBottom: `1px solid ${C.border}` }}>
-                {[
-                  { label: `DATASET 1 — ${fileA?.name}`, color: C.blue },
-                  { label: `DATASET 2 — ${fileB?.name}`, color: C.purple },
-                  { label: "KEY 🔑", color: C.amber },
-                  { label: "", color: C.green },
-                  { label: "IGNORE CASE", color: C.textLight },
-                  { label: "", color: "" },
-                ].map((h, i) => (
-                  <div key={i} style={{ ...S.label, color: h.color, textAlign: i >= 2 ? "center" : "left", display: i === 3 ? "flex" : "block", alignItems: "center", gap: 4, flexDirection: "column" }}>
-                    {i === 3 ? (
-                      <>
-                        <span style={{ color: C.green }}>COMPARE ✓</span>
-                        <div style={{ display: "flex", gap: 4, marginTop: 2 }}>
-                          <button onClick={() => setAllCompare(true)} style={{ ...S.btn(allCompareOn, C.green), padding: "2px 7px", fontSize: 9, fontWeight: 700 }}>All</button>
-                          <button onClick={() => setAllCompare(false)} style={{ ...S.btn(!anyCompareOn, C.red), padding: "2px 7px", fontSize: 9, fontWeight: 700 }}>None</button>
-                        </div>
-                      </>
-                    ) : h.label}
-                  </div>
-                ))}
-              </div>
-
-              <div style={{ maxHeight: 380, overflowY: "auto" }}>
-                {mappings.map((m, i) => (
-                  <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 1fr 64px 80px 96px 32px", alignItems: "center", padding: "6px 14px", borderBottom: `1px solid ${C.border}20`, background: m.isKey ? "#FFFBEB" : i % 2 ? C.surface : C.bg }}>
-                    <div style={{ paddingRight: 8 }}><ColSelect value={m.colA} options={headersA} color={C.blue} onChange={v => updateMapping(i, "colA", v)} /></div>
-                    <div style={{ paddingRight: 8 }}><ColSelect value={m.colB} options={headersB} color={C.purple} onChange={v => updateMapping(i, "colB", v)} /></div>
-                    <div style={{ textAlign: "center" }}><Radio checked={m.isKey} color={C.amber} onChange={() => updateMapping(i, "isKey", !m.isKey)} /></div>
-                    <div style={{ textAlign: "center" }}><Checkbox checked={m.compare && !m.isKey} color={C.green} onChange={() => { if (!m.isKey) updateMapping(i, "compare", !m.compare); }} /></div>
-                    <div style={{ textAlign: "center" }}><Checkbox checked={m.ignoreCase} color={C.textLight} onChange={() => updateMapping(i, "ignoreCase", !m.ignoreCase)} /></div>
-                    <div style={{ textAlign: "center" }}>
-                      <button onClick={() => setMappings(p => p.filter((_, j) => j !== i))} style={{ background: "none", border: "none", color: C.textLight, cursor: "pointer", fontSize: 16, lineHeight: 1 }}>×</button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-
-              <div style={{ padding: "8px 14px", background: "#F8FAFC", borderTop: `1px solid ${C.border}`, display: "flex", gap: 16, fontSize: 11 }}>
-                <span style={{ color: C.textLight }}>Total: <b style={{ color: C.blue }}>{mappings.length}</b></span>
-                <span style={{ color: C.textLight }}>Keys: <b style={{ color: C.amber }}>{mappings.filter(m => m.isKey).length}</b></span>
-                <span style={{ color: C.textLight }}>Compare: <b style={{ color: C.green }}>{mappings.filter(m => m.compare && !m.isKey).length}</b></span>
-                <span style={{ color: C.textLight }}>Ignore Case: <b>{mappings.filter(m => m.ignoreCase).length}</b></span>
-              </div>
-            </div>
-
-            <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
-              <button onClick={() => setStep(0)} style={{ ...S.btn(false), padding: "10px 22px" }}>← Back</button>
-              <button onClick={runComparison} style={S.btnPrimary}>🚀 Run Comparison</button>
-            </div>
-          </div>
-        )}
-
-        {/* ══ STEP 2 — RESULTS ══ */}
-        {step === 2 && stats && (
-          <div>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: 8, marginBottom: 16 }}>
-              {[
-                { label: "Total A", val: stats.totalA, color: C.blue, bg: C.blueLight },
-                { label: "Total B", val: stats.totalB, color: C.purple, bg: C.purpleLight },
-                { label: "Matched", val: stats.matched, color: C.green, bg: C.greenLight },
-                { label: "Mismatched", val: stats.mismatched, color: C.red, bg: C.redLight },
-                { label: "Only in A", val: stats.onlyA, color: C.amber, bg: C.amberLight },
-                { label: "Only in B", val: stats.onlyB, color: C.purple, bg: C.purpleLight },
-                { label: "Duplicates", val: stats.duplicates, color: C.textMid, bg: "#F1F5F9" },
-              ].map(s => (
-                <div key={s.label} style={{ background: s.bg, border: `1px solid ${s.color}30`, borderTop: `3px solid ${s.color}`, borderRadius: 10, padding: "12px 8px", textAlign: "center", boxShadow: "0 1px 3px rgba(0,0,0,0.04)" }}>
-                  <div style={{ fontSize: 20, fontWeight: 800, color: s.color }}>{s.val}</div>
-                  <div style={{ fontSize: 9, color: C.textLight, marginTop: 2, fontWeight: 600, letterSpacing: "0.05em" }}>{s.label.toUpperCase()}</div>
-                </div>
-              ))}
-            </div>
-
-            <div style={{ ...S.card, padding: "12px 16px", marginBottom: 14, boxShadow: "none" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 7 }}>
-                <span style={{ color: C.textMid, fontWeight: 600 }}>Match Rate — {fileA?.name} vs {fileB?.name}</span>
-                <span style={{ color: C.green, fontWeight: 700 }}>{((stats.matched / (stats.matched + stats.mismatched || 1)) * 100).toFixed(1)}%</span>
-              </div>
-              <div style={{ height: 7, background: "#E2E8F0", borderRadius: 99, display: "flex", overflow: "hidden" }}>
-                {[{ w: stats.matched, c: C.green }, { w: stats.mismatched, c: C.red }, { w: stats.onlyA, c: C.amber }, { w: stats.onlyB, c: C.purple }].map((s, i) => {
-                  const t = stats.matched + stats.mismatched + stats.onlyA + stats.onlyB || 1;
-                  return <div key={i} style={{ width: `${(s.w / t) * 100}%`, background: s.c }} />;
-                })}
-              </div>
-            </div>
-
-            {sessions.length > 1 && (
-              <div style={{ background: C.greenLight, border: `1px solid ${C.green}33`, borderRadius: 9, padding: "8px 14px", marginBottom: 12, fontSize: 11, color: C.green, fontWeight: 600 }}>
-                📚 {sessions.length} sessions accumulated — Export Excel will include all sessions in one workbook
-              </div>
-            )}
-
-            <div style={{ display: "flex", gap: 5, marginBottom: 14, alignItems: "center", flexWrap: "wrap" }}>
-              {[["dashboard", "📊 Dashboard"], ["detail", "🔍 Detail Report"], ["sheet", "📋 Comparison Sheet"]].map(([t, label]) => (
-                <button key={t} onClick={() => setActiveTab(t)} style={S.btn(activeTab === t)}>{label}</button>
-              ))}
-              <div style={{ flex: 1 }} />
-              <button onClick={handleExport} disabled={exporting}
-                style={{ ...S.btn(false), background: exporting ? C.textLight : C.green, color: "#fff", border: "none", fontWeight: 700, padding: "7px 16px", opacity: exporting ? 0.7 : 1, cursor: exporting ? "wait" : "pointer" }}>
-                {exporting ? "⏳ Exporting…" : `⬇ Export Excel (${sessions.length} session${sessions.length > 1 ? "s" : ""})`}
-              </button>
-              <button onClick={() => { setStep(0); setResults(null); }}
-                style={{ ...S.btn(false), color: C.blue, borderColor: C.blue, fontWeight: 700 }}>+ New Comparison</button>
-              <button onClick={() => setStep(1)} style={S.btn(false)}>← Remap</button>
-            </div>
-
-            {/* DASHBOARD */}
-            {activeTab === "dashboard" && (
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
-                <div style={{ ...S.card, padding: 20 }}>
-                  <div style={{ ...S.label, marginBottom: 14 }}>CLASSIFICATION BREAKDOWN</div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 20 }}>
-                    <svg width="110" height="110" viewBox="0 0 110 110">
-                      {(() => {
-                        const segs = [{ val: stats.matched, c: C.green }, { val: stats.mismatched, c: C.red }, { val: stats.onlyA, c: C.amber }, { val: stats.onlyB, c: C.purple }];
-                        const total = segs.reduce((s, x) => s + x.val, 0) || 1;
-                        const r = 42, cx = 55, cy = 55; let angle = -Math.PI / 2;
-                        return segs.map((s, i) => {
-                          if (!s.val) return null;
-                          const sweep = (s.val / total) * 2 * Math.PI;
-                          const x1 = cx + r * Math.cos(angle), y1 = cy + r * Math.sin(angle);
-                          angle += sweep;
-                          return <path key={i} d={`M${cx},${cy} L${x1},${y1} A${r},${r} 0 ${sweep > Math.PI ? 1 : 0} 1 ${cx + r * Math.cos(angle)},${cy + r * Math.sin(angle)} Z`} fill={s.c} opacity={0.9} />;
-                        });
-                      })()}
-                      <circle cx="55" cy="55" r="26" fill="white" />
-                      <text x="55" y="59" textAnchor="middle" fill={C.text} fontSize="11" fontWeight="bold" fontFamily="Inter">{((stats.matched / (stats.matched + stats.mismatched || 1)) * 100).toFixed(0)}%</text>
-                    </svg>
-                    <div style={{ flex: 1 }}>
-                      {[["Matched", stats.matched, C.green], ["Mismatched", stats.mismatched, C.red], ["Only A", stats.onlyA, C.amber], ["Only B", stats.onlyB, C.purple]].map(([l, v, c]) => (
-                        <div key={l} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-                          <div style={{ width: 8, height: 8, borderRadius: 2, background: c, flexShrink: 0 }} />
-                          <span style={{ flex: 1, fontSize: 12, color: C.textMid }}>{l}</span>
-                          <span style={{ fontWeight: 700, color: c }}>{v}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-                <div style={{ ...S.card, padding: 20 }}>
-                  <div style={{ ...S.label, marginBottom: 14 }}>MISMATCHES BY FIELD</div>
-                  {compareMappings.length === 0 && <div style={{ color: C.textLight, fontSize: 12 }}>No compare columns configured</div>}
-                  {compareMappings.slice(0, 8).map(m => {
-                    const total = results.results.filter(r => r.rowA && r.rowB).length || 1;
-                    const mis = results.results.filter(r => r.details.some(d => d.colA === m.colA && d.status === "Mismatched")).length;
-                    const pct = (mis / total) * 100;
-                    return (
-                      <div key={m.colA} style={{ marginBottom: 11 }}>
-                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 4 }}>
-                          <span style={{ color: C.textMid }}>{m.colA}</span>
-                          <span style={{ color: pct > 10 ? C.red : C.green, fontWeight: 700 }}>{mis} ({pct.toFixed(1)}%)</span>
-                        </div>
-                        <div style={{ height: 5, background: "#E2E8F0", borderRadius: 99 }}>
-                          <div style={{ width: `${pct}%`, height: "100%", background: pct > 10 ? C.red : C.green, borderRadius: 99 }} />
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-
-            {/* DETAIL REPORT */}
-            {activeTab === "detail" && (
-              <div style={S.card}>
-                <div style={{ padding: "11px 14px", borderBottom: `1px solid ${C.border}`, display: "flex", gap: 7, alignItems: "center", flexWrap: "wrap", background: "#F8FAFC" }}>
-                  <input placeholder="Search composite key..." value={searchKey} onChange={e => setSearchKey(e.target.value)} style={{ ...S.input, flex: 1, minWidth: 130 }} />
-                  {["All", "Matched", "Mismatched", "Only in A", "Only in B"].map(s => (
-                    <button key={s} onClick={() => setFilterStatus(s)} style={S.btn(filterStatus === s)}>{s}</button>
-                  ))}
-                  <span style={{ fontSize: 11, color: C.textLight }}>{filteredResults.length} rows</span>
-                </div>
-                <div style={{ overflowX: "auto", maxHeight: 420, overflowY: "auto" }}>
-                  <table style={{ borderCollapse: "collapse", width: "100%", fontSize: 11 }}>
-                    <thead style={{ position: "sticky", top: 0, zIndex: 1 }}>
-                      <tr>
-                        <th style={S.th}>Composite Key</th>
-                        {keyMappings.map(m => <th key={m.colA} style={{ ...S.th, color: C.amber }}>{m.colA}</th>)}
-                        {compareMappings.map(m => (
-                          <React.Fragment key={m.colA}>
-                            <th style={{ ...S.th, color: C.blue, borderLeft: `2px solid ${C.border}` }}>{m.colA}</th>
-                            <th style={{ ...S.th, color: C.purple }}>{m.colB} (B)</th>
-                            <th style={{ ...S.th, color: C.amber }}>Diff</th>
-                            <th style={{ ...S.th, color: C.textLight }}>Comment</th>
-                          </React.Fragment>
-                        ))}
-                        <th style={S.th}>Status</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {filteredResults.slice(0, 200).map((r, i) => (
-                        <tr key={i} style={{ background: i % 2 ? C.bg : C.surface }}>
-                          <td style={{ ...S.td, color: C.textMid, maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis" }}>{r.key}</td>
-                          {keyMappings.map(m => <td key={m.colA} style={{ ...S.td, color: C.textMid }}>{r.keyVals[m.colA] ?? "—"}</td>)}
-                          {compareMappings.map(m => {
-                            const d = r.details.find(d => d.colA === m.colA);
-                            const isMis = d?.status === "Mismatched";
-                            const diff = d?.diff || "";
-                            const comment = makeComment(diff, d?.valA || "", d?.valB || "", r.status);
-                            return (
-                              <React.Fragment key={m.colA}>
-                                <td style={{ ...S.td, color: C.blue, borderLeft: `2px solid ${C.border}`, background: isMis ? C.redLight : "transparent" }}>{d ? d.valA : (r.rowA ? r.rowA[m.colA] ?? "—" : "—")}</td>
-                                <td style={{ ...S.td, color: C.purple, background: isMis ? C.redLight : "transparent" }}>{d ? d.valB : (r.rowB ? r.rowB[m.colB] ?? "—" : "—")}</td>
-                                <td style={{ ...S.td, color: isMis ? C.red : C.textLight, fontWeight: isMis ? 700 : 400 }}>{diff || "—"}</td>
-                                <td style={{ ...S.td, color: C.amber, fontStyle: "italic", fontSize: 10 }}>{comment}</td>
-                              </React.Fragment>
-                            );
-                          })}
-                          <td style={S.td}><StatusBadge status={r.status} /></td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                  {filteredResults.length === 0 && <div style={{ padding: 32, textAlign: "center", color: C.textLight }}>No records match filter.</div>}
-                  {filteredResults.length > 200 && <div style={{ padding: 8, textAlign: "center", color: C.textLight, fontSize: 10 }}>Showing 200 of {filteredResults.length} — Export Excel for all.</div>}
-                </div>
-              </div>
-            )}
-
-            {/* COMPARISON SHEET */}
-            {activeTab === "sheet" && (() => {
-              const s0 = sessions[sessions.length - 1];
-              if (!s0) return null;
-              const cMaps0 = s0.mappings.filter(m => m.compare && !m.isKey && m.colA && m.colB);
-              const firstRowA = s0.results.find(r => r.rowA)?.rowA || {};
-              const allColsA = Object.keys(firstRowA);
-              const compareColsSet = new Set(cMaps0.map(m => m.colA));
-              const sharedCols = allColsA.filter(c => !compareColsSet.has(c));
-
-              return (
-                <div>
-                  <div style={{ background: C.blueLight, border: `1px solid ${C.blue}22`, borderRadius: 9, padding: "10px 14px", marginBottom: 10, fontSize: 11, display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap" }}>
-                    <span style={{ color: C.textMid }}>📋 <b style={{ color: C.text }}>1 row per file per record</b> — shared cols shown once per row, <b style={{ color: C.red }}>compare cols highlighted in red</b> with Current | Current (USOPTE) | Difference | Comment</span>
-                    <span style={{ color: C.green, fontWeight: 700, marginLeft: "auto" }}>{sessions.reduce((a, s) => a + s.results.length * 2, 0)} total rows across {sessions.length} session{sessions.length !== 1 ? "s" : ""}</span>
-                  </div>
-
-                  <div style={{ ...S.card }}>
-                    <div style={{ overflowX: "auto", maxHeight: 520, overflowY: "auto" }}>
-                      <table style={{ borderCollapse: "collapse", fontSize: 10 }}>
-                        <thead style={{ position: "sticky", top: 0, zIndex: 2 }}>
-                          <tr>
-                            <th style={{ ...S.th, minWidth: 80, background: C.headerBg, color: "#fff" }}>Status</th>
-                            <th style={{ ...S.th, minWidth: 100, background: C.headerBg, color: "#fff" }}>Source</th>
-                            <th style={{ ...S.th, minWidth: 160, background: C.headerBg, color: "#fff" }}>Composite Key</th>
-                            {sharedCols.map(c => <th key={c} style={{ ...S.th, background: C.headerBg, color: "#CBD5E1", minWidth: 90 }}>{c}</th>)}
-                            {cMaps0.map(m => (
-                              <React.Fragment key={m.colA}>
-                                <th style={{ ...S.th, background: "#7F1D1D", color: "#FCA5A5", borderLeft: "2px solid #991B1B", minWidth: 100 }}>{m.colA}</th>
-                                <th style={{ ...S.th, background: "#7F1D1D", color: "#FCA5A5", minWidth: 120 }}>{m.colB} (USOPTE)</th>
-                                <th style={{ ...S.th, background: "#7F1D1D", color: "#FCA5A5", minWidth: 80 }}>Difference</th>
-                                <th style={{ ...S.th, background: "#7F1D1D", color: "#FCA5A5", borderRight: "2px solid #991B1B", minWidth: 130 }}>Comment</th>
-                              </React.Fragment>
-                            ))}
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {sessions.flatMap((s, si) => {
-                            const kMaps = s.mappings.filter(m => m.isKey && m.colA && m.colB);
-                            const sCmaps = s.mappings.filter(m => m.compare && !m.isKey && m.colA && m.colB);
-                            const bMap = Object.fromEntries(s.mappings.filter(m => m.colA && m.colB).map(m => [m.colA, m.colB]));
-
-                            return s.results.slice(0, 100).flatMap((r, ri) => {
-                              const key = kMaps.map(m => r.keyVals[m.colA] ?? "").join("|");
-                              const isMismatch = r.status !== "Matched";
-                              const pairBg = isMismatch ? "#FFF5F5" : ri % 2 === 0 ? C.surface : C.bg;
-                              const pairBgB = isMismatch ? "#FFF0F0" : ri % 2 === 0 ? "#F5F8FF" : "#EFF4FF";
-
-                              const sharedValsA = sharedCols.map(c => r.rowA ? (r.rowA[c] ?? "") : "");
-                              const sharedValsB = sharedCols.map(c => { const cb = bMap[c]; return r.rowB && cb ? (r.rowB[cb] ?? "") : ""; });
-
-                              const cValsA = cMaps0.flatMap(m => {
-                                const sc = sCmaps.find(x => x.colA === m.colA);
-                                const valA = sc && r.rowA ? (r.rowA[sc.colA] ?? "") : "";
-                                const d = r.details?.find(d => d.colA === m.colA);
-                                const diff = d?.diff || "";
-                                const comment = makeComment(diff, d?.valA || "", d?.valB || "", r.status);
-                                const isMis = d?.status === "Mismatched";
-                                return [
-                                  <td key={`${m.colA}-a`} style={{ ...S.td, color: isMis ? C.red : C.blue, background: isMis ? "#FFDDDD" : "#FFF8F8", borderLeft: "2px solid #FECACA", fontWeight: isMis ? 700 : 400 }}>{valA || "—"}</td>,
-                                  <td key={`${m.colB}-u`} style={{ ...S.td, color: "#888", background: "#FFF8F8" }}>—</td>,
-                                  <td key={`${m.colA}-d`} style={{ ...S.td, color: isMis ? C.red : C.textLight, fontWeight: isMis ? 700 : 400, background: isMis ? "#FFDDDD" : "#FFF8F8" }}>{isMis ? diff : "—"}</td>,
-                                  <td key={`${m.colA}-c`} style={{ ...S.td, color: C.amber, fontStyle: "italic", background: "#FFF8F8", borderRight: "2px solid #FECACA" }}>{isMis ? comment : ""}</td>,
-                                ];
-                              });
-
-                              const cValsB = cMaps0.flatMap(m => {
-                                const sc = sCmaps.find(x => x.colA === m.colA);
-                                const valB = sc && r.rowB ? (r.rowB[sc.colB] ?? "") : "";
-                                const d = r.details?.find(d => d.colA === m.colA);
-                                const isMis = d?.status === "Mismatched";
-                                return [
-                                  <td key={`${m.colA}-a2`} style={{ ...S.td, color: "#888", background: "#FFF8F8", borderLeft: "2px solid #FECACA" }}>—</td>,
-                                  <td key={`${m.colB}-u2`} style={{ ...S.td, color: isMis ? C.purple : C.purple, background: isMis ? "#FFE8FF" : "#FFF8F8", fontWeight: isMis ? 700 : 400 }}>{valB || "—"}</td>,
-                                  <td key={`${m.colA}-d2`} style={{ ...S.td, background: "#FFF8F8" }}>—</td>,
-                                  <td key={`${m.colA}-c2`} style={{ ...S.td, background: "#FFF8F8", borderRight: "2px solid #FECACA" }}>—</td>,
-                                ];
-                              });
-
-                              return [
-                                <tr key={`${si}-${ri}-a`} style={{ background: pairBg }}>
-                                  <td style={{ ...S.td }}><StatusBadge status={r.status} /></td>
-                                  <td style={{ ...S.td, color: C.blue, fontWeight: 600, fontSize: 10 }}>{s.fileAName}</td>
-                                  <td style={{ ...S.td, color: C.textMid, maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis" }}>{key}</td>
-                                  {sharedValsA.map((v, vi) => <td key={vi} style={{ ...S.td, color: C.textMid }}>{v}</td>)}
-                                  {cValsA}
-                                </tr>,
-                                <tr key={`${si}-${ri}-b`} style={{ background: pairBgB, borderBottom: `2px solid ${C.border}` }}>
-                                  <td style={{ ...S.td, color: C.textLight }}></td>
-                                  <td style={{ ...S.td, color: C.purple, fontWeight: 600, fontSize: 10 }}>{s.fileBName}</td>
-                                  <td style={{ ...S.td, color: C.textLight }}>{key}</td>
-                                  {sharedValsB.map((v, vi) => <td key={vi} style={{ ...S.td, color: C.textLight }}>{v}</td>)}
-                                  {cValsB}
-                                </tr>
-                              ];
-                            });
-                          })}
-                        </tbody>
-                      </table>
-                      {sessions.reduce((a, s) => a + s.results.length, 0) > 100 && (
-                        <div style={{ padding: 10, textAlign: "center", color: C.textLight, fontSize: 10, borderTop: `1px solid ${C.border}` }}>Showing first 100 records per session — Export Excel for complete data</div>
-                      )}
-                    </div>
-                  </div>
-                  <div style={{ marginTop: 8, fontSize: 10, color: C.textLight, textAlign: "center" }}>
-                    <b style={{ color: C.red }}>Red columns</b> = comparison fields (Current, Current USOPTE, Difference, Comment) &nbsp;·&nbsp; Thick line separates each record pair &nbsp;·&nbsp; Export Excel for full formatted workbook
-                  </div>
-                </div>
-              );
-            })()}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
+        style={{ border: `2px dashed ${drag ? color : file ? C.green : C.border}`, borderRadius: 12, padding: "22px 16px", textAlign: "center", cursor: "pointer", background: drag ? `${color}08` :
