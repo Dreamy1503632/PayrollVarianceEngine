@@ -198,24 +198,45 @@ async function exportXLSX(sessions, onMsg) {
   onMsg("Encoding sheets...");
   await yieldUI();
 
-  // Build sheet XML async — yield every 500 rows
+  // Build sheet XML async — encode in small chunks, never one giant string
   async function buildSheet(rows) {
-    const parts = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>'];
-    for (let r = 0; r < rows.length; r++) {
-      const [cells, si] = rows[r];
-      let x = '<row r="' + (r + 1) + '">';
-      for (let c = 0; c < cells.length; c++) {
-        const v = cells[c], a = cn(c) + (r + 1), sv = String(v ?? "");
-        const isN = sv !== "" && sv.trim() !== "" && !isNaN(Number(sv)) && !/[%]/.test(sv);
-        x += isN ? '<c r="' + a + '" s="' + si + '"><v>' + sv + '</v></c>'
-          : '<c r="' + a + '" s="' + si + '" t="inlineStr"><is><t>' + esc(v) + '</t></is></c>';
+    const chunks = [];
+    let totalLen = 0;
+    const push = (s) => { const b = te.encode(s); chunks.push(b); totalLen += b.length; };
+
+    push('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>');
+
+    // Process in micro-batches of 200 rows, encode each batch immediately
+    const BATCH = 200;
+    for (let start = 0; start < rows.length; start += BATCH) {
+      let xml = "";
+      const end = Math.min(start + BATCH, rows.length);
+      for (let r = start; r < end; r++) {
+        const [cells, si] = rows[r];
+        xml += '<row r="' + (r + 1) + '">';
+        for (let c = 0; c < cells.length; c++) {
+          const v = cells[c], a = cn(c) + (r + 1), sv = String(v ?? "");
+          const isN = sv !== "" && sv.trim() !== "" && !isNaN(Number(sv)) && !/[%]/.test(sv);
+          xml += isN ? '<c r="' + a + '" s="' + si + '"><v>' + sv + '</v></c>'
+            : '<c r="' + a + '" s="' + si + '" t="inlineStr"><is><t>' + esc(v) + '</t></is></c>';
+        }
+        xml += '</row>';
       }
-      x += '</row>';
-      parts.push(x);
-      if (r % 500 === 0) await yieldUI();
+      // Encode this batch to bytes immediately, free the string
+      const b = te.encode(xml);
+      chunks.push(b);
+      totalLen += b.length;
+      xml = "";
+      if (start % 2000 === 0) await yieldUI();
     }
-    parts.push('</sheetData></worksheet>');
-    return te.encode(parts.join(""));
+
+    push('</sheetData></worksheet>');
+
+    // Concatenate all byte chunks into one Uint8Array
+    const out = new Uint8Array(totalLen);
+    let pos = 0;
+    for (const ch of chunks) { out.set(ch, pos); pos += ch.length; }
+    return out;
   }
 
   const sheet1 = await buildSheet(sum);
