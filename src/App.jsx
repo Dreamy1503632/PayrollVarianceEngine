@@ -1,762 +1,466 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useMemo } from "react";
+import * as Papa from "papaparse";
+import _ from "lodash";
 
-/* ═══ PARSERS ═══ */
-function parseCSV(text) {
-  const lines = text.trim().split(/\r?\n/);
-  if (!lines.length) return [];
-  const hdrs = lines[0].split(",").map(h => h.trim().replace(/^"|"$/g, ""));
-  return lines.slice(1).map(line => {
-    const vals = line.match(/(".*?"|[^,]+|(?<=,)(?=,)|(?<=,)$|^(?=,))/g) || [];
-    const row = {};
-    hdrs.forEach((h, i) => { row[h] = (vals[i] || "").replace(/^"|"$/g, "").trim(); });
-    return row;
-  });
-}
-function parseTSV(text) {
-  const lines = text.trim().split(/\r?\n/);
-  if (!lines.length) return [];
-  const hdrs = lines[0].split("\t").map(h => h.trim());
-  return lines.slice(1).map(line => {
-    const v = line.split("\t"); const row = {};
-    hdrs.forEach((h, i) => { row[h] = (v[i] || "").trim(); }); return row;
-  });
-}
-function parsePipe(text) {
-  const lines = text.trim().split(/\r?\n/);
-  if (!lines.length) return [];
-  const hdrs = lines[0].split("|").map(h => h.trim());
-  return lines.slice(1).map(line => {
-    const v = line.split("|"); const row = {};
-    hdrs.forEach((h, i) => { row[h] = (v[i] || "").trim(); }); return row;
-  });
-}
-function autoDetect(text) {
-  const f = text.split(/\r?\n/)[0] || "";
-  if (f.includes("|")) return parsePipe(text);
-  if (f.includes("\t")) return parseTSV(text);
-  return parseCSV(text);
-}
-async function parseFile(file) {
-  return new Promise((res, rej) => {
-    const ext = file.name.split(".").pop().toLowerCase();
-    const rdr = new FileReader();
-    if (["xlsx", "xls"].includes(ext)) {
-      rdr.onload = async e => {
-        try {
-          const { read, utils } = await import("https://cdn.sheetjs.com/xlsx-0.20.1/package/xlsx.mjs");
-          const wb = read(new Uint8Array(e.target.result), { type: "array" });
-          const data = utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: "" });
-          res(data.map(r => Object.fromEntries(Object.entries(r).map(([k, v]) => [String(k).trim(), String(v).trim()]))));
-        } catch (err) { rej(err); }
-      };
-      rdr.readAsArrayBuffer(file);
-    } else {
-      rdr.onload = e => {
-        const t = e.target.result;
-        res(ext === "tsv" ? parseTSV(t) : autoDetect(t));
-      };
-      rdr.readAsText(file);
-    }
-  });
-}
+const fmt = (n) => (typeof n === "number" ? n.toLocaleString() : n);
+const pct = (n, d) => (d === 0 ? "0.0%" : ((n / d) * 100).toFixed(1) + "%");
+const cleanNum = (s) => {
+  if (s === null || s === undefined || String(s).trim() === "") return 0;
+  return parseFloat(String(s).replace(/,/g, "")) || 0;
+};
 
-/* ═══ AUTO MAP ═══ */
-function autoMapHeaders(ha, hb) {
-  const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
-  const used = new Set();
-  const keys = ["personnumber", "balancename", "area1", "area2", "area3"];
-  return ha.map(a => {
-    const na = norm(a); let best = "", bs = 0;
-    for (const b of hb) { if (used.has(b)) continue; const nb = norm(b); const sc = na === nb ? 100 : (na.includes(nb) || nb.includes(na)) ? 75 : 0; if (sc > bs) { bs = sc; best = b; } }
-    if (best && bs >= 75) used.add(best);
-    const isKey = keys.some(k => na.includes(k));
-    return { colA: a, colB: best && bs >= 75 ? best : "", isKey, compare: !isKey && !!(best && bs >= 75), ignoreCase: false };
-  });
-}
-
-/* ═══ COMPARE ═══ */
-function compare(dA, dB, maps, tol) {
-  const tp = parseFloat(tol) / 100 || 0;
-  const km = maps.filter(m => m.isKey && m.colA && m.colB);
-  const cm = maps.filter(m => m.compare && !m.isKey && m.colA && m.colB);
-  const mk = (row, a) => km.map(m => ((a ? row[m.colA] : row[m.colB]) || "").toString().toLowerCase().trim()).join("||");
-  const idx = {};
-  for (const r of dB) { const k = mk(r, false); (idx[k] = idx[k] || []).push(r); }
-  const res = [], mb = new Set();
-  for (const rA of dA) {
-    const k = mk(rA, true), kv = Object.fromEntries(km.map(m => [m.colA, rA[m.colA] ?? ""]));
-    const bs = idx[k] || [];
-    if (!bs.length) { res.push({ key: k, rowA: rA, rowB: null, status: "Only in A", details: [], keyVals: kv }); continue; }
-    const rB = bs[0]; mb.add(k);
-    const det = cm.map(m => {
-      const vA = rA[m.colA] ?? "", vB = rB[m.colB] ?? "";
-      const a = m.ignoreCase ? vA.toLowerCase() : vA, b = m.ignoreCase ? vB.toLowerCase() : vB;
-      const nA = parseFloat(vA), nB = parseFloat(vB), isN = !isNaN(nA) && !isNaN(nB);
-      let d = "", st = "Matched";
-      if (isN) { const p = nA !== 0 ? Math.abs(nA - nB) / Math.abs(nA) : nB !== 0 ? 1 : 0; d = (nB - nA).toFixed(4); if (p > tp) st = "Mismatched"; }
-      else if (a.trim() !== b.trim()) { d = vA + "\u2192" + vB; st = "Mismatched"; }
-      return { colA: m.colA, colB: m.colB, valA: vA, valB: vB, diff: d, status: st };
+const parseFile = (file) =>
+  new Promise((resolve, reject) => {
+    Papa.parse(file, {
+      header: true, skipEmptyLines: true, dynamicTyping: false,
+      complete: (r) => {
+        const cols = r.meta.fields.filter((f) => f && f.trim() !== "");
+        const data = r.data.map((row) => { const c = {}; cols.forEach((cl) => (c[cl] = row[cl] ?? "")); return c; });
+        resolve({ columns: cols, data });
+      },
+      error: reject,
     });
-    res.push({ key: k, rowA: rA, rowB: rB, status: det.some(d => d.status === "Mismatched") ? "Mismatched" : "Matched", details: det, keyVals: kv });
-  }
-  for (const r of dB) { const k = mk(r, false); if (!mb.has(k)) { res.push({ key: k, rowA: null, rowB: r, status: "Only in B", details: [], keyVals: Object.fromEntries(km.map(m => [m.colA, r[m.colB] ?? ""])) }); mb.add(k); } }
-  const kc = {}; for (const r of dA) { const k = mk(r, true); kc[k] = (kc[k] || 0) + 1; }
-  return { results: res, dupes: Object.values(kc).filter(c => c > 1).reduce((s, c) => s + c - 1, 0) };
-}
+  });
 
-function skComment(diff, st) {
-  if (st === "Only in A") return "Only in File A";
-  if (st === "Only in B") return "Only in File B";
-  if (!diff || diff === "0.0000") return "";
-  const n = parseFloat(diff);
-  if (!isNaN(n)) return Math.abs(n) < 1 ? "Less than $1 difference" : "More $ Difference";
-  return "Value mismatch";
-}
+const parseCSVString = (csvStr) => {
+  const r = Papa.parse(csvStr.trim(), { header: true, skipEmptyLines: true, dynamicTyping: false });
+  const cols = r.meta.fields.filter((f) => f && f.trim() !== "");
+  const data = r.data.map((row) => { const c = {}; cols.forEach((cl) => (c[cl] = row[cl] ?? "")); return c; });
+  return { columns: cols, data };
+};
 
-/* ═══ XLSX EXPORT — async chunked, no crash ═══ */
-function yieldUI() { return new Promise(r => setTimeout(r, 0)); }
+const runComparison = (data1, data2, mappings) => {
+  const keyMappings = mappings.filter((m) => m.isKey);
+  const compareMappings = mappings.filter((m) => m.compare && !m.isKey);
+  const allActiveMappings = mappings.filter((m) => m.compare || m.isKey);
+  const makeKey = (row, side) =>
+    keyMappings.map((m) => {
+      const col = side === 1 ? m.col1 : m.col2;
+      let val = String(row[col] ?? "").trim();
+      if (m.ignoreCase) val = val.toLowerCase();
+      return val;
+    }).join("||");
+  const map1 = new Map(); const map2 = new Map();
+  data1.forEach((row) => { const k = makeKey(row, 1); if (!map1.has(k)) map1.set(k, []); map1.get(k).push(row); });
+  data2.forEach((row) => { const k = makeKey(row, 2); if (!map2.has(k)) map2.set(k, []); map2.get(k).push(row); });
+  const allKeys = new Set([...map1.keys(), ...map2.keys()]);
+  const matched = []; const mismatched = []; const onlyIn1 = []; const onlyIn2 = [];
+  allKeys.forEach((k) => {
+    const rows1 = map1.get(k); const rows2 = map2.get(k);
+    if (!rows1) { rows2.forEach((r) => onlyIn2.push({ key: k, row: r })); return; }
+    if (!rows2) { rows1.forEach((r) => onlyIn1.push({ key: k, row: r })); return; }
+    const r1 = rows1[0]; const r2 = rows2[0]; const diffs = {}; let hasDiff = false;
+    compareMappings.forEach((m) => {
+      let v1 = String(r1[m.col1] ?? "").trim(); let v2 = String(r2[m.col2] ?? "").trim();
+      if (m.ignoreCase) { v1 = v1.toLowerCase(); v2 = v2.toLowerCase(); }
+      const n1 = cleanNum(v1); const n2 = cleanNum(v2);
+      const isNum = !isNaN(n1) && !isNaN(n2) && v1 !== "" && v2 !== "";
+      if (isNum) {
+        const tol = parseFloat(m.tolerance) || 0;
+        if (Math.abs(n1 - n2) > tol) { diffs[m.col1] = { v1: n1, v2: n2, diff: n2 - n1 }; hasDiff = true; }
+      } else { if (v1 !== v2) { diffs[m.col1] = { v1, v2, diff: null }; hasDiff = true; } }
+    });
+    if (hasDiff) mismatched.push({ key: k, row1: r1, row2: r2, diffs });
+    else matched.push({ key: k, row1: r1, row2: r2 });
+  });
+  const catCol = keyMappings.find((m) => { const l = m.col1.toLowerCase(); return l.includes("category") || l.includes("type"); })?.col1 || keyMappings[1]?.col1 || keyMappings[0]?.col1;
+  const catStats = {};
+  const addCat = (row, type) => { const cat = row[catCol] || "(blank)"; if (!catStats[cat]) catStats[cat] = { matched: 0, mismatched: 0, onlyIn1: 0, onlyIn2: 0 }; catStats[cat][type]++; };
+  matched.forEach((m) => addCat(m.row1, "matched")); mismatched.forEach((m) => addCat(m.row1, "mismatched"));
+  onlyIn1.forEach((m) => addCat(m.row, "onlyIn1")); onlyIn2.forEach((m) => addCat(m.row, "onlyIn2"));
+  return { matched, mismatched, onlyIn1, onlyIn2, catStats, catCol, keyMappings, compareMappings, allActiveMappings };
+};
 
-async function exportXLSX(sessions, onMsg) {
-  onMsg("Preparing data...");
-  await yieldUI();
-
-  const te = new TextEncoder();
-  const esc = s => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-  const cn = n => { let s = ""; for (; n >= 0; n = Math.floor(n / 26) - 1) s = String.fromCharCode(65 + n % 26) + s; return s; };
-
-  const s0 = sessions[0];
-  const cmp0 = s0.mappings.filter(m => m.compare && !m.isKey && m.colA && m.colB);
-  const fr = s0.results.find(r => r.rowA)?.rowA || {};
-  const allC = Object.keys(fr);
-  const cmpSet = new Set(cmp0.map(m => m.colA));
-  const shC = allC.filter(c => !cmpSet.has(c));
-
-  // Build rows as simple arrays: [cells[], styleIndex]
-  // Styles: 0=normal 1=header 2=mismatch 3=onlyA 4=onlyB 5=matched
-  const stIdx = st => st === "Mismatched" ? 2 : st === "Only in A" ? 3 : st === "Only in B" ? 4 : st === "Matched" ? 5 : 0;
+/* ── INTERACTIVE EXCEL EXPORT ── */
+const exportExcel = (results, mappings, file1Name, file2Name) => {
+  const { mismatched, onlyIn1, onlyIn2, matched, keyMappings, compareMappings, catStats, catCol } = results;
+  const total = matched.length + mismatched.length + onlyIn1.length + onlyIn2.length;
+  const sheets = {};
 
   // Sheet 1: Summary
-  const sum = [
-    [["CompareIQ Summary"], 1], [[], 0],
-    [["#", "File A", "File B", "Total A", "Total B", "Matched", "Mismatched", "Only A", "Only B", "Dupes", "Match%"], 1],
-    ...sessions.map((s, i) => [[i + 1, s.fileAName, s.fileBName, s.totalA, s.totalB, s.matched, s.mismatched, s.onlyA, s.onlyB, s.dupes, ((s.matched / (s.matched + s.mismatched || 1)) * 100).toFixed(1) + "%"], 0])
-  ];
+  let s = "Category,Count,Percentage\n";
+  s += `Total Unique Keys,${total},100.0%\n`;
+  s += `Exact Matches,${matched.length},${pct(matched.length,total)}\n`;
+  s += `Value Mismatches,${mismatched.length},${pct(mismatched.length,total)}\n`;
+  s += `Only in ${file1Name},${onlyIn1.length},${pct(onlyIn1.length,total)}\n`;
+  s += `Only in ${file2Name},${onlyIn2.length},${pct(onlyIn2.length,total)}\n`;
+  s += `\nPrimary Key,${keyMappings.map(m=>m.col1).join(" + ")}\n`;
+  s += `Compare Columns,${compareMappings.map(m=>m.col1).join("; ")}\n`;
+  s += `Dataset 1,${file1Name}\nDataset 2,${file2Name}\n`;
+  sheets["Summary"] = s;
 
-  onMsg("Building comparison results...");
-  await yieldUI();
-
-  // Sheet 2: Comparison Results (non-matched only, 2 rows per record)
-  const compH = ["Status", "Source", "Key", ...allC];
-  const comp = [[compH, 1]];
-  for (const s of sessions) {
-    const km = s.mappings.filter(m => m.isKey && m.colA && m.colB);
-    const bm = Object.fromEntries(s.mappings.filter(m => m.colA && m.colB).map(m => [m.colA, m.colB]));
-    for (const r of s.results) {
-      if (r.status === "Matched") continue;
-      const k = km.map(m => r.keyVals[m.colA] ?? "").join("|");
-      const si = stIdx(r.status);
-      comp.push([[r.status, s.fileAName, k, ...allC.map(c => r.rowA ? (r.rowA[c] ?? "") : "")], si]);
-      comp.push([[r.status, s.fileBName, k, ...allC.map(c => { const cb = bm[c]; return r.rowB && cb ? (r.rowB[cb] ?? "") : ""; })], si]);
-    }
-  }
-
-  onMsg("Building difference mismatch...");
-  await yieldUI();
-
-  // Sheet 3: Difference Mismatch (SK USOPTE format)
-  const diffH = ["Status", "Source", "Key", ...shC, ...cmp0.flatMap(m => [m.colA, m.colA + " (USOPTE)", "Difference", "SK Comment"])];
-  const diff = [[diffH, 1]];
-  for (const s of sessions) {
-    const km = s.mappings.filter(m => m.isKey && m.colA && m.colB);
-    const sc = s.mappings.filter(m => m.compare && !m.isKey && m.colA && m.colB);
-    const bm = Object.fromEntries(s.mappings.filter(m => m.colA && m.colB).map(m => [m.colA, m.colB]));
-    for (const r of s.results) {
-      if (r.status === "Matched") continue;
-      const k = km.map(m => r.keyVals[m.colA] ?? "").join("|");
-      const si = stIdx(r.status);
-      // Row A
-      const shA = shC.map(c => r.rowA ? (r.rowA[c] ?? "") : (r.rowB && bm[c] ? (r.rowB[bm[c]] ?? "") : ""));
-      const cA = cmp0.flatMap(m => {
-        const f = sc.find(x => x.colA === m.colA);
-        const vA = f && r.rowA ? (r.rowA[f.colA] ?? "") : "";
-        const d = r.details?.find(x => x.colA === m.colA);
-        const df = d?.diff || "";
-        return [vA, "", df ? (parseFloat(df) || df) : "", skComment(df, r.status)];
-      });
-      diff.push([[r.status, s.fileAName, k, ...shA, ...cA], si]);
-      // Row B
-      const shB = shC.map(c => { const cb = bm[c]; return r.rowB && cb ? (r.rowB[cb] ?? "") : ""; });
-      const cB = cmp0.flatMap(m => {
-        const f = sc.find(x => x.colA === m.colA);
-        const vB = f && r.rowB ? (r.rowB[f.colB] ?? "") : "";
-        return ["", vB, "", ""];
-      });
-      diff.push([[r.status, s.fileBName, k, ...shB, ...cB], si]);
-    }
-  }
-
-  onMsg("Encoding sheets...");
-  await yieldUI();
-
-  // Build sheet XML async — encode in small chunks, never one giant string
-  async function buildSheet(rows) {
-    const chunks = [];
-    let totalLen = 0;
-    const push = (s) => { const b = te.encode(s); chunks.push(b); totalLen += b.length; };
-
-    push('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>');
-
-    // Process in micro-batches of 200 rows, encode each batch immediately
-    const BATCH = 200;
-    for (let start = 0; start < rows.length; start += BATCH) {
-      let xml = "";
-      const end = Math.min(start + BATCH, rows.length);
-      for (let r = start; r < end; r++) {
-        const [cells, si] = rows[r];
-        xml += '<row r="' + (r + 1) + '">';
-        for (let c = 0; c < cells.length; c++) {
-          const v = cells[c], a = cn(c) + (r + 1), sv = String(v ?? "");
-          const isN = sv !== "" && sv.trim() !== "" && !isNaN(Number(sv)) && !/[%]/.test(sv);
-          xml += isN ? '<c r="' + a + '" s="' + si + '"><v>' + sv + '</v></c>'
-            : '<c r="' + a + '" s="' + si + '" t="inlineStr"><is><t>' + esc(v) + '</t></is></c>';
-        }
-        xml += '</row>';
-      }
-      // Encode this batch to bytes immediately, free the string
-      const b = te.encode(xml);
-      chunks.push(b);
-      totalLen += b.length;
-      xml = "";
-      if (start % 2000 === 0) await yieldUI();
-    }
-
-    push('</sheetData></worksheet>');
-
-    // Concatenate all byte chunks into one Uint8Array
-    const out = new Uint8Array(totalLen);
-    let pos = 0;
-    for (const ch of chunks) { out.set(ch, pos); pos += ch.length; }
-    return out;
-  }
-
-  const sheet1 = await buildSheet(sum);
-  onMsg("Encoding sheet 2/" + 3 + "...");
-  const sheet2 = await buildSheet(comp);
-  onMsg("Encoding sheet 3/" + 3 + "...");
-  const sheet3 = await buildSheet(diff);
-
-  onMsg("Creating ZIP file...");
-  await yieldUI();
-
-  const sheets = [
-    { name: "Summary", data: sheet1 },
-    { name: "Comparison Results", data: sheet2 },
-    { name: "Difference Mismatch", data: sheet3 },
-  ];
-
-  const styXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font></fonts><fills count="8"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF1A2332"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFFEF2F2"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFFFFBEB"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFF5F3FF"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFECFDF5"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFFFFFFF"/></patternFill></fill></fills><borders count="2"><border><left/><right/><top/><bottom/><diagonal/></border><border><left style="thin"><color auto="1"/></left><right style="thin"><color auto="1"/></right><top style="thin"><color auto="1"/></top><bottom style="thin"><color auto="1"/></bottom><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="6"><xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1"/><xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1"/><xf numFmtId="0" fontId="0" fillId="3" borderId="1" xfId="0" applyFill="1" applyBorder="1"/><xf numFmtId="0" fontId="0" fillId="4" borderId="1" xfId="0" applyFill="1" applyBorder="1"/><xf numFmtId="0" fontId="0" fillId="5" borderId="1" xfId="0" applyFill="1" applyBorder="1"/><xf numFmtId="0" fontId="0" fillId="6" borderId="1" xfId="0" applyFill="1" applyBorder="1"/></cellXfs></styleSheet>';
-
-  const wbXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>' + sheets.map((s, i) => '<sheet name="' + esc(s.name) + '" sheetId="' + (i + 1) + '" r:id="rId' + (i + 1) + '"/>').join("") + '</sheets></workbook>';
-  const wbRels = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' + sheets.map((s, i) => '<Relationship Id="rId' + (i + 1) + '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet' + (i + 1) + '.xml"/>').join("") + '<Relationship Id="rId' + (sheets.length + 1) + '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>';
-  const ctXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>' + sheets.map((s, i) => '<Override PartName="/xl/worksheets/sheet' + (i + 1) + '.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>').join("") + '</Types>';
-  const rrXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>';
-
-  // ZIP — single pre-sized buffer, no spread, no crash
-  const enc = s => te.encode(s);
-  const files = [
-    { n: "[Content_Types].xml", d: enc(ctXml) },
-    { n: "_rels/.rels", d: enc(rrXml) },
-    { n: "xl/workbook.xml", d: enc(wbXml) },
-    { n: "xl/_rels/workbook.xml.rels", d: enc(wbRels) },
-    { n: "xl/styles.xml", d: enc(styXml) },
-    ...sheets.map((s, i) => ({ n: "xl/worksheets/sheet" + (i + 1) + ".xml", d: s.data })),
-  ];
-
-  // CRC32
-  const crcT = new Uint32Array(256);
-  for (let i = 0; i < 256; i++) { let c = i; for (let j = 0; j < 8; j++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; crcT[i] = c; }
-  const crc32 = d => { let c = ~0; for (let i = 0; i < d.length; i++) c = crcT[(c ^ d[i]) & 0xFF] ^ (c >>> 8); return (~c) >>> 0; };
-
-  // Pre-calculate total ZIP size
-  let totalSz = 22; // EOCD
-  const entries = files.map(f => {
-    const nb = enc(f.n); const crc = crc32(f.d);
-    totalSz += 30 + nb.length + f.d.length + 46 + nb.length;
-    return { nb, d: f.d, crc };
+  // Sheet 2: Category Breakdown
+  let cb = `${catCol},Matched,Mismatched,Only ${file1Name},Only ${file2Name},Total,Match Rate\n`;
+  Object.entries(catStats).sort((a,b)=>b[1].mismatched-a[1].mismatched).forEach(([cat,st])=>{
+    const ct=st.matched+st.mismatched+st.onlyIn1+st.onlyIn2;
+    cb+=`"${cat}",${st.matched},${st.mismatched},${st.onlyIn1},${st.onlyIn2},${ct},${ct>0?((st.matched/ct)*100).toFixed(1):"100.0"}%\n`;
   });
+  sheets["By Category"] = cb;
 
-  const buf = new Uint8Array(totalSz);
-  const w16 = (o, v) => { buf[o] = v & 0xFF; buf[o + 1] = (v >> 8) & 0xFF; };
-  const w32 = (o, v) => { buf[o] = v & 0xFF; buf[o + 1] = (v >> 8) & 0xFF; buf[o + 2] = (v >> 16) & 0xFF; buf[o + 3] = (v >> 24) & 0xFF; };
+  // Sheet 3: Mismatches
+  const mH = [...keyMappings.map(m=>m.col1),"Status",...compareMappings.flatMap(m=>[`${m.col1} (${file1Name})`,`${m.col1} (${file2Name})`,`${m.col1} (Diff)`,`${m.col1} (Diff %)`])];
+  let mc = mH.join(",")+"\n";
+  mismatched.forEach(m=>{
+    const diffCols = Object.keys(m.diffs);
+    const status = diffCols.length > 3 ? "HIGH" : diffCols.length > 1 ? "MEDIUM" : "LOW";
+    mc += [...keyMappings.map(km=>`"${String(m.row1[km.col1]||"").replace(/"/g,'""')}"`), `"${status}"`,
+      ...compareMappings.flatMap(cm=>{
+        const d=m.diffs[cm.col1];
+        if(d&&d.diff!==null){const pctD=d.v1!==0?((d.diff/Math.abs(d.v1))*100).toFixed(2)+"%":"NEW";return[d.v1,d.v2,d.diff.toFixed(2),pctD];}
+        if(d)return[`"${d.v1}"`,`"${d.v2}"`,"TEXT DIFF",""];
+        const v=cleanNum(m.row1[cm.col1]);return[v,v,"0","0%"];
+      })].join(",")+"\n";
+  });
+  sheets["Mismatches"] = mc;
 
-  let lo = 0;
-  const offsets = [];
-  const cdStart = entries.reduce((s, e) => s + 30 + e.nb.length + e.d.length, 0);
-  let co = cdStart;
+  // Sheet 4: Only DS1
+  const allCols=[...keyMappings,...compareMappings];
+  let o1=allCols.map(m=>m.col1).join(",")+"\n";
+  onlyIn1.forEach(m=>{o1+=allCols.map(c=>`"${String(m.row[c.col1]||"").replace(/"/g,'""')}"`).join(",")+"\n";});
+  sheets[`Only ${file1Name.slice(0,20)}`]=o1;
 
-  for (let i = 0; i < entries.length; i++) {
-    const e = entries[i];
-    offsets.push(lo);
-    // Local header
-    buf[lo] = 0x50; buf[lo + 1] = 0x4B; buf[lo + 2] = 3; buf[lo + 3] = 4;
-    w16(lo + 4, 20); w32(lo + 14, e.crc); w32(lo + 18, e.d.length); w32(lo + 22, e.d.length);
-    w16(lo + 26, e.nb.length);
-    buf.set(e.nb, lo + 30);
-    buf.set(e.d, lo + 30 + e.nb.length);
-    lo += 30 + e.nb.length + e.d.length;
-    // Central dir
-    buf[co] = 0x50; buf[co + 1] = 0x4B; buf[co + 2] = 1; buf[co + 3] = 2;
-    w16(co + 4, 20); w16(co + 6, 20); w32(co + 16, e.crc); w32(co + 20, e.d.length); w32(co + 24, e.d.length);
-    w16(co + 28, e.nb.length); w32(co + 42, offsets[i]);
-    buf.set(e.nb, co + 46);
-    co += 46 + e.nb.length;
-  }
+  // Sheet 5: Only DS2
+  let o2=allCols.map(m=>m.col2).join(",")+"\n";
+  onlyIn2.forEach(m=>{o2+=allCols.map(c=>`"${String(m.row[c.col2]||"").replace(/"/g,'""')}"`).join(",")+"\n";});
+  sheets[`Only ${file2Name.slice(0,20)}`]=o2;
 
-  // EOCD
-  buf[co] = 0x50; buf[co + 1] = 0x4B; buf[co + 2] = 5; buf[co + 3] = 6;
-  w16(co + 8, entries.length); w16(co + 10, entries.length);
-  w32(co + 12, co - cdStart); w32(co + 16, cdStart);
+  // Sheet 6: All Matched
+  let am=[...keyMappings.map(m=>m.col1),...compareMappings.map(m=>m.col1)].join(",")+"\n";
+  matched.slice(0,5000).forEach(m=>{am+=[...keyMappings,...compareMappings].map(cm=>`"${String(m.row1[cm.col1]||"").replace(/"/g,'""')}"`).join(",")+"\n";});
+  sheets["Matched"]=am;
 
-  onMsg("Downloading...");
-  const blob = new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a"); a.href = url; a.download = "CompareIQ_Results.xlsx";
-  document.body.appendChild(a); a.click(); document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 5000);
-}
-
-/* ═══ STYLES ═══ */
-const C = {
-  bg: "#F7F9FC", sf: "#FFFFFF", bd: "#D1D9E6", bs: "#A0B0C8",
-  tx: "#1A2332", tm: "#4A5568", tl: "#718096",
-  bl: "#1A56DB", bll: "#EBF5FF", blm: "#3B82F6",
-  pu: "#7C3AED", pul: "#F5F3FF",
-  gn: "#059669", gnl: "#ECFDF5",
-  rd: "#DC2626", rdl: "#FEF2F2",
-  am: "#D97706", aml: "#FFFBEB",
-  hbg: "#1A2332",
+  const dl=(c,n)=>{const b=new Blob(["\uFEFF"+c],{type:"text/csv;charset=utf-8;"});const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download=n;a.click();};
+  Object.entries(sheets).forEach(([name,content],i)=>{
+    setTimeout(()=>dl(content,`CompareIQ_${name.replace(/[^a-zA-Z0-9]/g,"_")}.csv`),i*350);
+  });
 };
 
-const sCard = { background: C.sf, borderRadius: 12, border: `1px solid ${C.bd}`, overflow: "hidden", boxShadow: "0 1px 4px rgba(0,0,0,.06)" };
-const sTh = { padding: "10px 13px", textAlign: "left", borderBottom: `1px solid ${C.bd}`, whiteSpace: "nowrap", fontSize: 11, fontWeight: 700, color: C.tm, background: "#F0F4FA" };
-const sTd = { padding: "7px 12px", borderBottom: `1px solid ${C.bd}20`, whiteSpace: "nowrap", fontSize: 11, color: C.tx };
-const sInp = { background: C.sf, border: `1px solid ${C.bd}`, borderRadius: 7, padding: "7px 12px", color: C.tx, fontSize: 12, fontFamily: "inherit", outline: "none" };
-const sBtn = (on, cl = C.bl) => ({ background: on ? cl : C.sf, border: `1px solid ${on ? cl : C.bd}`, color: on ? "#fff" : C.tm, borderRadius: 7, padding: "7px 14px", cursor: "pointer", fontSize: 12, fontWeight: 600, fontFamily: "inherit" });
-const sBtnP = { background: `linear-gradient(135deg,${C.bl},${C.pu})`, color: "#fff", border: "none", borderRadius: 9, padding: "11px 32px", fontSize: 14, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" };
-const sLbl = { fontSize: 11, fontWeight: 700, color: C.tl, letterSpacing: ".05em" };
+// ── DEMO DATA ──
+const DEMO_CSV_1 = `Person Number,Person Name,Balance Category,Balance Name,Component Run Type,Gross Pay,Net Pay,Current,Year-to-Date,Primary Department
+121018,Aamina Khattak,Imputed Earnings,GTL Taxable,Regular Normal,594.00,218.02,1.70,8.50,USU_PSY-CSTS
+121018,Aamina Khattak,Standard Earnings,Regular Pay,Regular Normal,594.00,218.02,594.00,"4,459.29",USU_PSY-CSTS
+121018,Aamina Khattak,Employee Tax Deductions,FIT Withheld,Regular Normal,594.00,218.02,0.00,345.30,USU_PSY-CSTS
+121018,Aamina Khattak,Employee Tax Deductions,SS Withheld,Regular Normal,594.00,218.02,36.83,276.47,USU_PSY-CSTS
+121018,Aamina Khattak,Employee Tax Deductions,Medicare Withheld,Regular Normal,594.00,218.02,8.61,64.66,USU_PSY-CSTS
+121018,Aamina Khattak,Employer Taxes,SS ER,Regular Normal,594.00,218.02,36.83,276.47,USU_PSY-CSTS
+121018,Aamina Khattak,Employer Taxes,Medicare ER,Regular Normal,594.00,218.02,8.61,64.66,USU_PSY-CSTS
+121018,Aamina Khattak,Pretax Deductions,Medical Pre-Tax,Regular Normal,594.00,218.02,125.40,627.00,USU_PSY-CSTS
+121018,Aamina Khattak,Voluntary Deductions,Roth 403(b),Regular Normal,594.00,218.02,59.40,445.50,USU_PSY-CSTS
+119538,Ciera Price,Imputed Earnings,GTL Taxable,Regular Normal,"2,150.00","1,412.85",3.20,16.00,NMRC-ADMIN
+119538,Ciera Price,Standard Earnings,Regular Pay,Regular Normal,"2,150.00","1,412.85","2,150.00","10,750.00",NMRC-ADMIN
+119538,Ciera Price,Employee Tax Deductions,FIT Withheld,Regular Normal,"2,150.00","1,412.85",215.00,"1,075.00",NMRC-ADMIN
+119538,Ciera Price,Employee Tax Deductions,SS Withheld,Regular Normal,"2,150.00","1,412.85",133.30,666.50,NMRC-ADMIN
+119538,Ciera Price,Employee Tax Deductions,Medicare Withheld,Regular Normal,"2,150.00","1,412.85",31.18,155.88,NMRC-ADMIN
+119538,Ciera Price,Employee Tax Deductions,VA SIT Withheld,Regular Normal,"2,150.00","1,412.85",96.75,483.75,NMRC-ADMIN
+119538,Ciera Price,Employer Taxes,SS ER,Regular Normal,"2,150.00","1,412.85",133.30,666.50,NMRC-ADMIN
+119538,Ciera Price,Employer Taxes,Medicare ER,Regular Normal,"2,150.00","1,412.85",31.18,155.88,NMRC-ADMIN
+119538,Ciera Price,Employer Taxes,FUTA,Regular Normal,"2,150.00","1,412.85",0.00,42.00,NMRC-ADMIN
+119538,Ciera Price,Pretax Deductions,Dental Pre-Tax,Regular Normal,"2,150.00","1,412.85",18.50,92.50,NMRC-ADMIN
+119538,Ciera Price,Voluntary Deductions,Traditional 403(b),Regular Normal,"2,150.00","1,412.85",107.50,537.50,NMRC-ADMIN
+117721,Vassiliy Tsytsarev,Standard Earnings,Regular Pay,Regular Normal,"3,800.00","2,610.42","3,800.00","19,000.00",BIO-RESEARCH
+117721,Vassiliy Tsytsarev,Employee Tax Deductions,FIT Withheld,Regular Normal,"3,800.00","2,610.42",456.00,"2,280.00",BIO-RESEARCH
+117721,Vassiliy Tsytsarev,Employee Tax Deductions,SS Withheld,Regular Normal,"3,800.00","2,610.42",235.60,"1,178.00",BIO-RESEARCH
+117721,Vassiliy Tsytsarev,Employee Tax Deductions,Medicare Withheld,Regular Normal,"3,800.00","2,610.42",55.10,275.50,BIO-RESEARCH
+117721,Vassiliy Tsytsarev,Employee Tax Deductions,MD SIT Withheld,Regular Normal,"3,800.00","2,610.42",171.00,855.00,BIO-RESEARCH
+117721,Vassiliy Tsytsarev,Employer Taxes,SS ER,Regular Normal,"3,800.00","2,610.42",235.60,"1,178.00",BIO-RESEARCH
+117721,Vassiliy Tsytsarev,Employer Taxes,Medicare ER,Regular Normal,"3,800.00","2,610.42",55.10,275.50,BIO-RESEARCH
+117721,Vassiliy Tsytsarev,Pretax Deductions,Medical Pre-Tax,Regular Normal,"3,800.00","2,610.42",245.00,"1,225.00",BIO-RESEARCH
+900531,Fiona Kiprop,Standard Earnings,Regular Pay,Regular Normal,"1,923.08","1,345.16","1,923.08","9,615.38",EMER-MED
+900531,Fiona Kiprop,Employee Tax Deductions,FIT Withheld,Regular Normal,"1,923.08","1,345.16",192.31,961.54,EMER-MED
+900531,Fiona Kiprop,Employee Tax Deductions,SS Withheld,Regular Normal,"1,923.08","1,345.16",119.23,596.15,EMER-MED
+900531,Fiona Kiprop,Employer Taxes,SS ER,Regular Normal,"1,923.08","1,345.16",119.23,596.15,EMER-MED
+900531,Fiona Kiprop,Pretax Deductions,Vision Pre-Tax,Regular Normal,"1,923.08","1,345.16",12.00,60.00,EMER-MED
+120755,Franklin Morgan,Standard Earnings,Regular Pay,Regular Normal,"2,750.00","1,890.25","2,750.00","13,750.00",IT-SECURITY
+120755,Franklin Morgan,Employee Tax Deductions,FIT Withheld,Regular Normal,"2,750.00","1,890.25",302.50,"1,512.50",IT-SECURITY
+120755,Franklin Morgan,Employee Tax Deductions,SS Withheld,Regular Normal,"2,750.00","1,890.25",170.50,852.50,IT-SECURITY
+120755,Franklin Morgan,Employee Tax Deductions,Medicare Withheld,Regular Normal,"2,750.00","1,890.25",39.88,199.38,IT-SECURITY
+120755,Franklin Morgan,Employer Taxes,SS ER,Regular Normal,"2,750.00","1,890.25",170.50,852.50,IT-SECURITY
+120755,Franklin Morgan,Employer Taxes,Medicare ER,Regular Normal,"2,750.00","1,890.25",39.88,199.38,IT-SECURITY`;
 
-const Badge = ({ s }) => {
-  const m = { Matched: [C.gn, C.gnl], Mismatched: [C.rd, C.rdl], "Only in A": [C.am, C.aml], "Only in B": [C.pu, C.pul] };
-  const [c, b] = m[s] || [C.tl, C.bg];
-  return <span style={{ background: b, color: c, border: `1px solid ${c}33`, borderRadius: 5, padding: "2px 9px", fontSize: 10, fontWeight: 700 }}>{s}</span>;
+const DEMO_CSV_2 = `Person Number,Person Name,Balance Category,Balance Name,Component Run Type,Gross Pay,Net Pay,Current,Year-to-Date,Primary Department
+121018,Aamina Khattak,Imputed Earnings,GTL Taxable,Regular Normal,594.00,218.02,1.70,8.50,USU_PSY-CSTS
+121018,Aamina Khattak,Standard Earnings,Regular Pay,Regular Normal,594.00,218.02,594.00,"4,459.29",USU_PSY-CSTS
+121018,Aamina Khattak,Employee Tax Deductions,FIT Withheld,Regular Normal,594.00,218.02,0.00,345.30,USU_PSY-CSTS
+121018,Aamina Khattak,Employee Tax Deductions,SS Withheld,Regular Normal,594.00,218.02,36.83,276.47,USU_PSY-CSTS
+121018,Aamina Khattak,Employee Tax Deductions,Medicare Withheld,Regular Normal,594.00,218.02,8.61,64.66,USU_PSY-CSTS
+121018,Aamina Khattak,Employer Taxes,SS ER,Regular Normal,594.00,218.02,36.83,276.47,USU_PSY-CSTS
+121018,Aamina Khattak,Employer Taxes,Medicare ER,Regular Normal,594.00,218.02,8.61,64.66,USU_PSY-CSTS
+121018,Aamina Khattak,Pretax Deductions,Medical Pre-Tax,Regular Normal,594.00,218.02,125.40,627.00,USU_PSY-CSTS
+121018,Aamina Khattak,Voluntary Deductions,Roth 403(b),Regular Normal,594.00,218.02,59.40,445.50,USU_PSY-CSTS
+119538,Ciera Price,Imputed Earnings,GTL Taxable,Regular Normal,"2,150.00","1,412.85",3.20,16.00,NMRC-ADMIN
+119538,Ciera Price,Standard Earnings,Regular Pay,Regular Normal,"2,150.00","1,412.85","2,150.00","10,750.00",NMRC-ADMIN
+119538,Ciera Price,Employee Tax Deductions,FIT Withheld,Regular Normal,"2,150.00","1,412.85",228.50,"1,142.50",NMRC-ADMIN
+119538,Ciera Price,Employee Tax Deductions,SS Withheld,Regular Normal,"2,150.00","1,412.85",139.75,698.75,NMRC-ADMIN
+119538,Ciera Price,Employee Tax Deductions,Medicare Withheld,Regular Normal,"2,150.00","1,412.85",33.25,166.25,NMRC-ADMIN
+119538,Ciera Price,Employee Tax Deductions,VA SIT Withheld,Regular Normal,"2,150.00","1,412.85",102.15,510.75,NMRC-ADMIN
+119538,Ciera Price,Employee Tax Deductions,VA LIT Withheld,Regular Normal,"2,150.00","1,412.85",15.05,75.25,NMRC-ADMIN
+119538,Ciera Price,Employer Taxes,SS ER,Regular Normal,"2,150.00","1,412.85",139.75,698.75,NMRC-ADMIN
+119538,Ciera Price,Employer Taxes,Medicare ER,Regular Normal,"2,150.00","1,412.85",33.25,166.25,NMRC-ADMIN
+119538,Ciera Price,Employer Taxes,FUTA,Regular Normal,"2,150.00","1,412.85",0.00,42.00,NMRC-ADMIN
+119538,Ciera Price,Pretax Deductions,Dental Pre-Tax,Regular Normal,"2,150.00","1,412.85",18.50,92.50,NMRC-ADMIN
+119538,Ciera Price,Voluntary Deductions,Traditional 403(b),Regular Normal,"2,150.00","1,412.85",107.50,537.50,NMRC-ADMIN
+117721,Vassiliy Tsytsarev,Standard Earnings,Regular Pay,Regular Normal,"3,800.00","2,610.42","3,800.00","19,000.00",BIO-RESEARCH
+117721,Vassiliy Tsytsarev,Employee Tax Deductions,FIT Withheld,Regular Normal,"3,800.00","2,610.42",480.00,"2,400.00",BIO-RESEARCH
+117721,Vassiliy Tsytsarev,Employee Tax Deductions,SS Withheld,Regular Normal,"3,800.00","2,610.42",247.00,"1,235.00",BIO-RESEARCH
+117721,Vassiliy Tsytsarev,Employee Tax Deductions,Medicare Withheld,Regular Normal,"3,800.00","2,610.42",57.80,289.00,BIO-RESEARCH
+117721,Vassiliy Tsytsarev,Employee Tax Deductions,MD SIT Withheld,Regular Normal,"3,800.00","2,610.42",180.50,902.50,BIO-RESEARCH
+117721,Vassiliy Tsytsarev,Employer Taxes,SS ER,Regular Normal,"3,800.00","2,610.42",247.00,"1,235.00",BIO-RESEARCH
+117721,Vassiliy Tsytsarev,Employer Taxes,Medicare ER,Regular Normal,"3,800.00","2,610.42",57.80,289.00,BIO-RESEARCH
+117721,Vassiliy Tsytsarev,Pretax Deductions,Medical Pre-Tax,Regular Normal,"3,800.00","2,610.42",245.00,"1,225.00",BIO-RESEARCH
+900531,Fiona Kiprop,Standard Earnings,Regular Pay,Regular Normal,"1,923.08","1,345.16","1,923.08","9,615.38",EMER-MED
+900531,Fiona Kiprop,Employee Tax Deductions,FIT Withheld,Regular Normal,"1,923.08","1,345.16",200.00,"1,000.00",EMER-MED
+900531,Fiona Kiprop,Employee Tax Deductions,SS Withheld,Regular Normal,"1,923.08","1,345.16",125.00,625.00,EMER-MED
+900531,Fiona Kiprop,Employer Taxes,SS ER,Regular Normal,"1,923.08","1,345.16",125.00,625.00,EMER-MED
+900531,Fiona Kiprop,Pretax Deductions,Vision Pre-Tax,Regular Normal,"1,923.08","1,345.16",12.00,60.00,EMER-MED
+120755,Franklin Morgan,Standard Earnings,Regular Pay,Regular Normal,"2,750.00","1,890.25","2,750.00","13,750.00",IT-SECURITY
+120755,Franklin Morgan,Employee Tax Deductions,FIT Withheld,Regular Normal,"2,750.00","1,890.25",318.00,"1,590.00",IT-SECURITY
+120755,Franklin Morgan,Employee Tax Deductions,SS Withheld,Regular Normal,"2,750.00","1,890.25",178.75,893.75,IT-SECURITY
+120755,Franklin Morgan,Employee Tax Deductions,Medicare Withheld,Regular Normal,"2,750.00","1,890.25",41.80,209.00,IT-SECURITY
+120755,Franklin Morgan,Employer Taxes,SS ER,Regular Normal,"2,750.00","1,890.25",178.75,893.75,IT-SECURITY
+120755,Franklin Morgan,Employer Taxes,Medicare ER,Regular Normal,"2,750.00","1,890.25",41.80,209.00,IT-SECURITY`;
+
+const Ico = {
+  Upload: () => <svg width="28" height="28" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.5"><path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"/></svg>,
+  Swap: () => <svg width="18" height="18" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M7.5 21L3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5"/></svg>,
+  Key: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12.65 10C11.83 7.67 9.61 6 7 6c-3.31 0-6 2.69-6 6s2.69 6 6 6c2.61 0 4.83-1.67 5.65-4H17v4h4v-4h2v-4H12.65zM7 14c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2z"/></svg>,
+  Download: () => <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3"/></svg>,
+  Search: () => <svg width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z"/></svg>,
+  Info: () => <svg width="16" height="16" viewBox="0 0 24 24" fill="#3B82F6"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01" stroke="#fff" strokeWidth="2" strokeLinecap="round"/></svg>,
+  Play: () => <svg width="18" height="18" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M5.25 5.653c0-.856.917-1.398 1.667-.986l11.54 6.348a1.125 1.125 0 010 1.971l-11.54 6.347a1.125 1.125 0 01-1.667-.985V5.653z"/></svg>,
 };
 
-export default function App() {
-  const [step, setStep] = useState(0);
-  const [fA, setFA] = useState(null), [fB, setFB] = useState(null);
-  const [dA, setDA] = useState([]), [dB, setDB] = useState([]);
-  const [hA, setHA] = useState([]), [hB, setHB] = useState([]);
-  const [maps, setMaps] = useState([]);
-  const [tol, setTol] = useState("1");
-  const [res, setRes] = useState(null);
+export default function CompareIQPro() {
+  const [step, setStep] = useState("upload");
+  const [file1, setFile1] = useState(null);
+  const [file2, setFile2] = useState(null);
+  const [data1, setData1] = useState(null);
+  const [data2, setData2] = useState(null);
+  const [mappings, setMappings] = useState([]);
+  const [results, setResults] = useState(null);
+  const [activeTab, setActiveTab] = useState("overview");
+  const [searchTerm, setSearchTerm] = useState("");
   const [loading, setLoading] = useState(false);
-  const [exporting, setExporting] = useState(false);
-  const [expMsg, setExpMsg] = useState("");
-  const [err, setErr] = useState("");
-  const [tab, setTab] = useState("dashboard");
-  const [filt, setFilt] = useState("All");
-  const [search, setSearch] = useState("");
-  const [sessions, setSessions] = useState([]);
+  const [sortConfig, setSortConfig] = useState({ key: null, dir: "asc" });
+  const [demoMode, setDemoMode] = useState(false);
+  const ref1 = useRef(); const ref2 = useRef();
 
-  const doExport = useCallback(async () => {
-    if (!sessions.length) return;
-    setExporting(true); setErr("");
-    try { await exportXLSX(sessions, setExpMsg); } catch (e) { setErr("Export failed: " + e.message); }
-    setExporting(false); setExpMsg("");
-  }, [sessions]);
+  const buildMappings = (p1, p2) => p1.columns.map((col) => ({
+    col1: col, col2: p2.columns.includes(col) ? col : p2.columns.find((c) => c.toLowerCase() === col.toLowerCase()) || "",
+    isKey: false, compare: true, ignoreCase: false, tolerance: "0",
+  }));
 
-  const loadFile = async (file, w) => {
-    setErr(""); setLoading(true);
+  const handleFiles = async (f1, f2) => {
+    setLoading(true);
     try {
-      const d = await parseFile(file);
-      if (!d.length) throw new Error("No data");
-      const h = Object.keys(d[0]);
-      if (w === "A") { setFA(file); setDA(d); setHA(h); } else { setFB(file); setDB(d); setHB(h); }
-    } catch (e) { setErr(e.message); }
+      const [p1, p2] = await Promise.all([parseFile(f1), parseFile(f2)]);
+      setData1(p1); setData2(p2); setMappings(buildMappings(p1, p2)); setDemoMode(false); setStep("config");
+    } catch (e) { alert("Error: " + e.message); }
     setLoading(false);
   };
 
-  const goMap = () => { if (!dA.length || !dB.length) { setErr("Upload both files"); return; } setMaps(autoMapHeaders(hA, hB)); setStep(1); };
-  const upMap = (i, f, v) => setMaps(p => p.map((m, j) => j === i ? { ...m, [f]: v } : m));
+  const loadDemo = () => {
+    const p1 = parseCSVString(DEMO_CSV_1); const p2 = parseCSVString(DEMO_CSV_2);
+    setData1(p1); setData2(p2);
+    setFile1({ name: "Payroll_Vertex_2_27.csv", size: 4200 }); setFile2({ name: "Payroll_USOPTE.csv", size: 4350 });
+    setDemoMode(true);
+    const maps = buildMappings(p1, p2);
+    ["Person Number","Balance Category","Balance Name","Component Run Type"].forEach(k=>{const m=maps.find(x=>x.col1===k);if(m)m.isKey=true;});
+    setMappings(maps); setStep("config");
+  };
 
-  const run = () => {
-    if (!maps.some(m => m.isKey)) { setErr("Mark at least one KEY"); return; }
+  const updateMapping = (i, f, v) => setMappings(p => { const n=[...p]; n[i]={...n[i],[f]:v}; return n; });
+  const keyCount = mappings.filter(m => m.isKey).length;
+  const compareCount = mappings.filter(m => m.compare).length;
+
+  const runCompare = () => {
+    if (keyCount === 0) return alert("Select at least one Key column");
     setLoading(true);
-    setTimeout(() => {
-      const r = compare(dA, dB, maps, tol); setRes(r);
-      const ct = s => r.results.filter(x => x.status === s).length;
-      setSessions(p => [...p, { fileAName: fA?.name || "A", fileBName: fB?.name || "B", results: r.results, totalA: dA.length, totalB: dB.length, matched: ct("Matched"), mismatched: ct("Mismatched"), onlyA: ct("Only in A"), onlyB: ct("Only in B"), dupes: r.dupes, mappings: [...maps] }]);
-      setStep(2); setLoading(false);
-    }, 100);
+    setTimeout(() => { setResults(runComparison(data1.data, data2.data, mappings)); setStep("results"); setActiveTab("overview"); setLoading(false); }, 50);
   };
 
-  const st = res ? {
-    tA: dA.length, tB: dB.length,
-    ma: res.results.filter(r => r.status === "Matched").length,
-    mi: res.results.filter(r => r.status === "Mismatched").length,
-    oA: res.results.filter(r => r.status === "Only in A").length,
-    oB: res.results.filter(r => r.status === "Only in B").length,
-    du: res.dupes,
-  } : null;
+  const filteredMismatches = useMemo(() => {
+    if (!results) return [];
+    let items = results.mismatched;
+    if (searchTerm) { const s = searchTerm.toLowerCase(); items = items.filter(m => results.keyMappings.some(km => String(m.row1[km.col1]).toLowerCase().includes(s))); }
+    if (sortConfig.key) items = [...items].sort((a, b) => { const ad = Math.abs(a.diffs[sortConfig.key]?.diff ?? 0); const bd = Math.abs(b.diffs[sortConfig.key]?.diff ?? 0); return sortConfig.dir === "asc" ? ad - bd : bd - ad; });
+    return items;
+  }, [results, searchTerm, sortConfig]);
 
-  const kMaps = maps.filter(m => m.isKey && m.colA && m.colB);
-  const cMaps = maps.filter(m => m.compare && !m.isKey && m.colA && m.colB);
-  const filtered = res ? res.results.filter(r => (filt === "All" || r.status === filt) && (!search || r.key.toLowerCase().includes(search.toLowerCase()))) : [];
+  const total = results ? results.matched.length + results.mismatched.length + results.onlyIn1.length + results.onlyIn2.length : 0;
 
-  const Drop = ({ label, file, onFile, color }) => {
-    const ref = useRef(), [dr, setDr] = useState(false);
-    return (
-      <div onClick={() => ref.current.click()} onDragOver={e => { e.preventDefault(); setDr(true); }} onDragLeave={() => setDr(false)}
-        onDrop={e => { e.preventDefault(); setDr(false); e.dataTransfer.files[0] && onFile(e.dataTransfer.files[0]); }}
-        style={{ border: `2px dashed ${dr ? color : file ? C.gn : C.bd}`, borderRadius: 12, padding: "22px 16px", textAlign: "center", cursor: "pointer", background: dr ? color + "08" : file ? C.gnl : C.bg }}>
-        <input ref={ref} type="file" accept=".csv,.xlsx,.xls,.txt,.tsv" style={{ display: "none" }} onChange={e => e.target.files[0] && onFile(e.target.files[0])} />
-        <div style={{ fontSize: 26, marginBottom: 6 }}>{file ? "\u2705" : "\uD83D\uDCC1"}</div>
-        <div style={{ fontWeight: 700, color: file ? C.gn : C.tm, fontSize: 13 }}>{file ? file.name : label}</div>
-        <div style={{ color: C.tl, fontSize: 11, marginTop: 4 }}>{file ? (file.size / 1024).toFixed(1) + " KB" : "CSV, Excel, TXT, TSV"}</div>
-      </div>
-    );
-  };
+  const C = { bg:"#F5F6F8",surface:"#FFFFFF",border:"#E2E5EA",borderLight:"#F0F1F4",text:"#1A1D26",textDim:"#6C7281",textLight:"#A0A6B4",primary:"#1A7F64",primaryBg:"#E8F5F0",key:"#D97706",keyBg:"#FFF8EB",keyBorder:"#FDE68A",green:"#059669",greenBg:"#ECFDF5",red:"#DC2626",redBg:"#FEF2F2",orange:"#D97706",orangeBg:"#FFFBEB",blue:"#2563EB",blueBg:"#EFF6FF",purple:"#7C3AED",purpleBg:"#F5F3FF" };
 
-  return (
-    <div style={{ minHeight: "100vh", background: C.bg, color: C.tx, fontFamily: "'Segoe UI',system-ui,sans-serif" }}>
-      {/* HEADER */}
-      <div style={{ background: C.hbg, padding: "12px 28px", display: "flex", alignItems: "center", justifyContent: "space-between", position: "sticky", top: 0, zIndex: 50 }}>
-        <div style={{ fontWeight: 800, fontSize: 18, color: "#fff" }}>CompareIQ</div>
-        <div style={{ display: "flex", gap: 6 }}>
-          {["Upload", "Map", "Results"].map((s, i) => (
-            <div key={s} style={{ display: "flex", alignItems: "center", gap: 4 }}>
-              <span onClick={() => step > i && setStep(i)} style={{ padding: "4px 14px", borderRadius: 20, background: step === i ? "#3B82F6" : step > i ? "#1E40AF" : "transparent", border: `1px solid ${step >= i ? "#3B82F6" : "#475569"}`, color: step >= i ? "#fff" : "#94A3B8", fontSize: 11, fontWeight: 600, cursor: step > i ? "pointer" : "default" }}>{s}</span>
-              {i < 2 && <span style={{ color: "#475569" }}>{"\u203A"}</span>}
+  // ═══ UPLOAD ═══
+  if (step === "upload") return (
+    <div style={{ minHeight:"100vh",background:C.bg,fontFamily:"'Segoe UI',-apple-system,sans-serif",color:C.text }}>
+      <div style={{ maxWidth:860,margin:"0 auto",padding:"40px 24px" }}>
+        <div style={{ display:"flex",alignItems:"center",gap:10,marginBottom:48 }}>
+          <div style={{ width:36,height:36,borderRadius:9,background:`linear-gradient(135deg,${C.primary},#15A07A)`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:14,fontWeight:800,color:"#fff" }}>IQ</div>
+          <span style={{ fontSize:21,fontWeight:700,letterSpacing:-0.5 }}>CompareIQ Pro</span>
+        </div>
+        <div style={{ textAlign:"center",marginBottom:36 }}>
+          <h1 style={{ fontSize:26,fontWeight:700,marginBottom:8 }}>Compare Any Two Datasets</h1>
+          <p style={{ fontSize:14,color:C.textDim,marginBottom:20 }}>Upload CSV, TXT or TSV — map columns, set keys, configure tolerance, get detailed results + Excel export</p>
+          <button onClick={loadDemo} style={{ padding:"10px 28px",borderRadius:10,border:`2px solid ${C.primary}`,background:C.primaryBg,color:C.primary,fontWeight:700,fontSize:14,cursor:"pointer",display:"inline-flex",alignItems:"center",gap:8 }}><Ico.Play /> Load Demo</button>
+        </div>
+        <div style={{ display:"flex",alignItems:"center",gap:16,justifyContent:"center",margin:"24px 0",color:C.textLight,fontSize:13 }}><div style={{height:1,flex:1,maxWidth:120,background:C.border}}/>or upload your files<div style={{height:1,flex:1,maxWidth:120,background:C.border}}/></div>
+        <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:20,marginBottom:32 }}>
+          {[{r:ref1,f:file1,s:setFile1,l:"Dataset 1"},{r:ref2,f:file2,s:setFile2,l:"Dataset 2"}].map(({r,f,s,l})=>(
+            <div key={l} onClick={()=>r.current?.click()} style={{ border:`2px dashed ${f?C.green:C.border}`,borderRadius:14,padding:"40px 20px",textAlign:"center",cursor:"pointer",background:f?C.greenBg:"#FAFBFC" }}>
+              <input ref={r} type="file" accept=".csv,.txt,.tsv" style={{display:"none"}} onChange={e=>{if(e.target.files[0])s(e.target.files[0]);}}/>
+              <div style={{marginBottom:10,color:f?C.green:C.textLight}}><Ico.Upload/></div>
+              <div style={{fontSize:14,fontWeight:600,marginBottom:4}}>{l}</div>
+              {f?<div style={{color:C.primary,fontSize:13,fontWeight:600}}>{f.name}</div>:<div style={{color:C.textLight,fontSize:13}}>Drop file or click</div>}
             </div>
           ))}
         </div>
+        <div style={{textAlign:"center"}}><button disabled={!file1||!file2||loading} onClick={()=>handleFiles(file1,file2)} style={{padding:"13px 40px",borderRadius:10,border:"none",fontWeight:700,fontSize:15,cursor:"pointer",background:C.primary,color:"#fff",opacity:!file1||!file2?0.4:1}}>{loading?"Parsing...":"Continue to Column Mapping →"}</button></div>
       </div>
+    </div>
+  );
 
-      <div style={{ maxWidth: 1100, margin: "0 auto", padding: "24px 20px" }}>
-        {err && <div style={{ background: C.rdl, border: `1px solid ${C.rd}33`, color: C.rd, borderRadius: 9, padding: "9px 14px", marginBottom: 14, fontSize: 12 }}>{err}</div>}
-        {loading && <div style={{ background: C.bll, borderRadius: 9, padding: "9px 14px", marginBottom: 14, fontSize: 12, color: C.bl }}>Processing...</div>}
-        {exporting && <div style={{ background: C.aml, borderRadius: 9, padding: "9px 14px", marginBottom: 14, fontSize: 12, color: C.am, fontWeight: 600 }}>{expMsg || "Exporting..."}</div>}
-
-        {/* ═══ STEP 0 ═══ */}
-        {step === 0 && (
-          <div>
-            <h1 style={{ fontWeight: 800, fontSize: 26, textAlign: "center", margin: "0 0 20px" }}>Upload Datasets</h1>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 24 }}>
-              {[{ l: "Dataset A (Source)", w: "A", f: fA, d: dA, h: hA, c: C.bl }, { l: "Dataset B (Target)", w: "B", f: fB, d: dB, h: hB, c: C.pu }].map(x => (
-                <div key={x.w}>
-                  <div style={{ ...sLbl, color: x.c, marginBottom: 8 }}>{x.w}</div>
-                  <Drop label={x.l} file={x.f} color={x.c} onFile={f => loadFile(f, x.w)} />
-                  {x.d.length > 0 && <div style={{ marginTop: 6, fontSize: 11, color: C.gn }}>{x.d.length} rows, {x.h.length} cols</div>}
-                </div>
-              ))}
-            </div>
-            <div style={{ textAlign: "center" }}>
-              <button onClick={goMap} disabled={!dA.length || !dB.length} style={{ ...sBtnP, opacity: dA.length && dB.length ? 1 : .4 }}>Map Columns {"\u2192"}</button>
-            </div>
+  // ═══ CONFIG (no Data Type column) ═══
+  if (step === "config") return (
+    <div style={{ minHeight:"100vh",background:C.bg,fontFamily:"'Segoe UI',-apple-system,sans-serif",color:C.text }}>
+      <div style={{ maxWidth:1000,margin:"0 auto",padding:"24px 24px" }}>
+        <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20,flexWrap:"wrap",gap:12 }}>
+          <div style={{ display:"flex",alignItems:"center",gap:14,flexWrap:"wrap" }}>
+            <span style={{fontSize:18,fontWeight:700}}>Column Mapping Configuration</span>
+            <span style={{display:"inline-flex",alignItems:"center",gap:5,padding:"4px 12px",borderRadius:14,background:C.greenBg,fontSize:12,fontWeight:600,color:C.green}}><span style={{width:7,height:7,borderRadius:"50%",background:C.green}}/>{file1?.name}</span>
+            <span style={{color:C.textLight}}><Ico.Swap/></span>
+            <span style={{display:"inline-flex",alignItems:"center",gap:5,padding:"4px 12px",borderRadius:14,background:C.orangeBg,fontSize:12,fontWeight:600,color:C.orange}}><span style={{width:7,height:7,borderRadius:"50%",background:C.orange}}/>{file2?.name}</span>
+            {demoMode&&<span style={{padding:"3px 10px",borderRadius:12,background:"#DBEAFE",color:"#1D4ED8",fontSize:11,fontWeight:700}}>DEMO</span>}
           </div>
-        )}
-
-        {/* ═══ STEP 1 ═══ */}
-        {step === 1 && (
-          <div>
-            <h1 style={{ fontWeight: 800, fontSize: 22, margin: "0 0 12px" }}>Column Mapping</h1>
-            <div style={{ display: "flex", gap: 10, marginBottom: 12, alignItems: "center" }}>
-              <span style={sLbl}>Tolerance</span>
-              <input type="number" value={tol} onChange={e => setTol(e.target.value)} style={{ ...sInp, width: 60, textAlign: "center" }} />
-              <span style={{ color: C.gn, fontWeight: 700 }}>%</span>
-              <div style={{ flex: 1 }} />
-              <button onClick={() => setMaps(p => p.map(m => m.isKey ? m : { ...m, compare: true }))} style={sBtn(false, C.gn)}>All Compare</button>
-              <button onClick={() => setMaps(p => p.map(m => m.isKey ? m : { ...m, compare: false }))} style={sBtn(false, C.rd)}>None</button>
-            </div>
-            <div style={sCard}>
-              <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                <thead>
-                  <tr>
-                    <th style={sTh}>File A</th><th style={sTh}>File B</th>
-                    <th style={{ ...sTh, textAlign: "center", width: 50 }}>Key</th>
-                    <th style={{ ...sTh, textAlign: "center", width: 70 }}>Compare</th>
-                    <th style={{ ...sTh, textAlign: "center", width: 80 }}>Ign. Case</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {maps.map((m, i) => (
-                    <tr key={i} style={{ background: m.isKey ? C.aml : i % 2 ? C.sf : C.bg }}>
-                      <td style={sTd}><b>{m.colA}</b></td>
-                      <td style={sTd}>
-                        <select value={m.colB} onChange={e => upMap(i, "colB", e.target.value)} style={{ ...sInp, width: "100%" }}>
-                          <option value="">-- skip --</option>
-                          {hB.map(h => <option key={h} value={h}>{h}</option>)}
-                        </select>
-                      </td>
-                      <td style={{ ...sTd, textAlign: "center" }}><input type="checkbox" checked={m.isKey} onChange={() => upMap(i, "isKey", !m.isKey)} /></td>
-                      <td style={{ ...sTd, textAlign: "center" }}><input type="checkbox" checked={m.compare} disabled={m.isKey} onChange={() => !m.isKey && upMap(i, "compare", !m.compare)} /></td>
-                      <td style={{ ...sTd, textAlign: "center" }}><input type="checkbox" checked={m.ignoreCase} onChange={() => upMap(i, "ignoreCase", !m.ignoreCase)} /></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            <div style={{ display: "flex", gap: 10, justifyContent: "center", marginTop: 16 }}>
-              <button onClick={() => setStep(0)} style={sBtn(false)}>{"\u2190"} Back</button>
-              <button onClick={run} style={sBtnP}>Run Comparison</button>
-            </div>
+          <div style={{display:"flex",gap:10}}>
+            <button onClick={()=>{setStep("upload");setData1(null);setData2(null);setFile1(null);setFile2(null);setDemoMode(false);}} style={{padding:"9px 20px",borderRadius:8,border:`1px solid ${C.border}`,background:"#fff",fontWeight:600,fontSize:13,cursor:"pointer",display:"flex",alignItems:"center",gap:6,color:C.text}}><Ico.Swap/> Change</button>
+            <button onClick={runCompare} disabled={loading||keyCount===0} style={{padding:"9px 24px",borderRadius:8,border:"none",background:C.primary,color:"#fff",fontWeight:700,fontSize:13,cursor:"pointer",opacity:keyCount===0?0.5:1}}>Compare</button>
           </div>
-        )}
-
-        {/* ═══ STEP 2 ═══ */}
-        {step === 2 && st && (
-          <div>
-            {/* Stats */}
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: 8, marginBottom: 16 }}>
-              {[["Total A", st.tA, C.bl, C.bll], ["Total B", st.tB, C.pu, C.pul], ["Matched", st.ma, C.gn, C.gnl], ["Mismatched", st.mi, C.rd, C.rdl], ["Only A", st.oA, C.am, C.aml], ["Only B", st.oB, C.pu, C.pul], ["Dupes", st.du, C.tm, "#F1F5F9"]].map(([l, v, c, b]) => (
-                <div key={l} style={{ background: b, borderTop: `3px solid ${c}`, borderRadius: 10, padding: "12px 8px", textAlign: "center", border: `1px solid ${c}30` }}>
-                  <div style={{ fontSize: 20, fontWeight: 800, color: c }}>{v}</div>
-                  <div style={{ fontSize: 9, color: C.tl, fontWeight: 600, marginTop: 2 }}>{l.toUpperCase()}</div>
-                </div>
-              ))}
-            </div>
-
-            {/* Match bar */}
-            <div style={{ ...sCard, padding: "12px 16px", marginBottom: 14 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 6 }}>
-                <span style={{ color: C.tm }}>Match Rate</span>
-                <span style={{ color: C.gn, fontWeight: 700 }}>{((st.ma / (st.ma + st.mi || 1)) * 100).toFixed(1)}%</span>
-              </div>
-              <div style={{ height: 7, background: "#E2E8F0", borderRadius: 99, display: "flex", overflow: "hidden" }}>
-                {[[st.ma, C.gn], [st.mi, C.rd], [st.oA, C.am], [st.oB, C.pu]].map(([w, c], i) => {
-                  const t = st.ma + st.mi + st.oA + st.oB || 1;
-                  return <div key={i} style={{ width: `${(w / t) * 100}%`, background: c }} />;
-                })}
-              </div>
-            </div>
-
-            {/* Tab bar */}
-            <div style={{ display: "flex", gap: 5, marginBottom: 14, flexWrap: "wrap", alignItems: "center" }}>
-              {[["dashboard", "Dashboard"], ["detail", "Detail Report"], ["sheet", "Comparison Sheet"]].map(([k, l]) => (
-                <button key={k} onClick={() => setTab(k)} style={sBtn(tab === k)}>{l}</button>
-              ))}
-              <div style={{ flex: 1 }} />
-              <button onClick={doExport} disabled={exporting} style={{ ...sBtn(false), background: C.gn, color: "#fff", border: "none", fontWeight: 700 }}>{exporting ? "Exporting..." : "Export Excel"}</button>
-              <button onClick={() => { setStep(0); setRes(null); }} style={{ ...sBtn(false), color: C.bl, borderColor: C.bl }}>+ New</button>
-              <button onClick={() => setStep(1)} style={sBtn(false)}>{"\u2190"} Remap</button>
-            </div>
-
-            {/* ─── DASHBOARD ─── */}
-            {tab === "dashboard" && (
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
-                <div style={{ ...sCard, padding: 20 }}>
-                  <div style={{ ...sLbl, marginBottom: 14 }}>BREAKDOWN</div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 20 }}>
-                    <svg width="110" height="110" viewBox="0 0 110 110">
-                      {(() => {
-                        const sg = [{ v: st.ma, c: C.gn }, { v: st.mi, c: C.rd }, { v: st.oA, c: C.am }, { v: st.oB, c: C.pu }];
-                        const tot = sg.reduce((s, x) => s + x.v, 0) || 1;
-                        let a = -Math.PI / 2;
-                        return sg.map((s, i) => {
-                          if (!s.v) return null;
-                          const sw = (s.v / tot) * 2 * Math.PI;
-                          const x1 = 55 + 42 * Math.cos(a), y1 = 55 + 42 * Math.sin(a);
-                          a += sw;
-                          return <path key={i} d={`M55,55 L${x1},${y1} A42,42 0 ${sw > Math.PI ? 1 : 0} 1 ${55 + 42 * Math.cos(a)},${55 + 42 * Math.sin(a)} Z`} fill={s.c} opacity={.9} />;
-                        });
-                      })()}
-                      <circle cx="55" cy="55" r="26" fill="white" />
-                      <text x="55" y="59" textAnchor="middle" fill={C.tx} fontSize="11" fontWeight="bold">{((st.ma / (st.ma + st.mi || 1)) * 100).toFixed(0)}%</text>
-                    </svg>
-                    <div style={{ flex: 1 }}>
-                      {[["Matched", st.ma, C.gn], ["Mismatched", st.mi, C.rd], ["Only A", st.oA, C.am], ["Only B", st.oB, C.pu]].map(([l, v, c]) => (
-                        <div key={l} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-                          <div style={{ width: 8, height: 8, borderRadius: 2, background: c }} />
-                          <span style={{ flex: 1, fontSize: 12, color: C.tm }}>{l}</span>
-                          <span style={{ fontWeight: 700, color: c }}>{v}</span>
-                        </div>
-                      ))}
-                    </div>
+        </div>
+        <div style={{background:"#fff",border:`1px solid ${C.border}`,borderRadius:12,overflow:"hidden"}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,padding:"12px 20px",background:"#F0F7FF",borderBottom:"1px solid #BFDBFE",fontSize:13,color:"#1D4ED8"}}><Ico.Info/><span>Map columns, set <strong style={{color:C.key}}>key columns</strong> for matching, and specify tolerance for numeric comparisons.</span></div>
+          <div style={{display:"grid",gridTemplateColumns:"1.3fr 1.3fr 62px 74px 74px 88px",gap:0,padding:"11px 20px",background:"#F9FAFB",borderBottom:`1px solid ${C.border}`}}>
+            {["DATASET 1","DATASET 2","KEY 🔑","COMPARE ✓","IGNORE CASE","TOLERANCE"].map((h,i)=>(
+              <div key={i} style={{fontSize:10.5,fontWeight:700,color:C.textDim,textTransform:"uppercase",letterSpacing:0.7,textAlign:i>1?"center":"left"}}>{h}</div>
+            ))}
+          </div>
+          <div style={{maxHeight:420,overflowY:"auto"}}>
+            {mappings.map((m,i)=>(
+              <div key={i} style={{display:"grid",gridTemplateColumns:"1.3fr 1.3fr 62px 74px 74px 88px",gap:0,padding:"7px 20px",borderBottom:`1px solid ${C.borderLight}`,alignItems:"center",background:i%2===0?"#fff":"#FAFBFC"}}>
+                <div style={{paddingRight:10}}>
+                  <div style={{display:"inline-flex",alignItems:"center",gap:6,padding:"7px 14px",borderRadius:8,background:m.isKey?C.keyBg:"#F3F4F6",border:`1px solid ${m.isKey?C.keyBorder:"#E5E7EB"}`,fontSize:13,fontWeight:500,maxWidth:"100%",overflow:"hidden"}}>
+                    {m.isKey&&<span style={{color:C.key,flexShrink:0}}><Ico.Key/></span>}
+                    <span style={{overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{m.col1}</span>
+                    <span style={{color:C.textLight,fontSize:10,marginLeft:4}}>✕ ▾</span>
                   </div>
                 </div>
-                <div style={{ ...sCard, padding: 20 }}>
-                  <div style={{ ...sLbl, marginBottom: 14 }}>MISMATCHES BY FIELD</div>
-                  {cMaps.slice(0, 8).map(m => {
-                    const tot = res.results.filter(r => r.rowA && r.rowB).length || 1;
-                    const mis = res.results.filter(r => r.details.some(d => d.colA === m.colA && d.status === "Mismatched")).length;
-                    const pct = (mis / tot) * 100;
-                    return (
-                      <div key={m.colA} style={{ marginBottom: 10 }}>
-                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 3 }}>
-                          <span>{m.colA}</span>
-                          <span style={{ color: pct > 10 ? C.rd : C.gn, fontWeight: 700 }}>{mis} ({pct.toFixed(1)}%)</span>
-                        </div>
-                        <div style={{ height: 5, background: "#E2E8F0", borderRadius: 99 }}>
-                          <div style={{ width: `${Math.min(pct, 100)}%`, height: "100%", background: pct > 10 ? C.rd : C.gn, borderRadius: 99 }} />
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-
-            {/* ─── DETAIL REPORT ─── */}
-            {tab === "detail" && (
-              <div style={sCard}>
-                <div style={{ padding: "10px 14px", borderBottom: `1px solid ${C.bd}`, display: "flex", gap: 7, flexWrap: "wrap", alignItems: "center", background: "#F8FAFC" }}>
-                  <input placeholder="Search key..." value={search} onChange={e => setSearch(e.target.value)} style={{ ...sInp, flex: 1, minWidth: 120 }} />
-                  {["All", "Matched", "Mismatched", "Only in A", "Only in B"].map(s => (
-                    <button key={s} onClick={() => setFilt(s)} style={sBtn(filt === s)}>{s}</button>
-                  ))}
-                  <span style={{ fontSize: 11, color: C.tl }}>{filtered.length}</span>
-                </div>
-                <div style={{ overflowX: "auto", maxHeight: 450, overflowY: "auto" }}>
-                  <table style={{ borderCollapse: "collapse", width: "100%", fontSize: 11 }}>
-                    <thead style={{ position: "sticky", top: 0, zIndex: 1 }}>
-                      <tr>
-                        <th style={sTh}>Status</th>
-                        {kMaps.map(m => <th key={m.colA} style={{ ...sTh, color: C.am }}>{m.colA}</th>)}
-                        {cMaps.map(m => (
-                          [<th key={m.colA + "a"} style={{ ...sTh, color: C.bl, borderLeft: `2px solid ${C.bd}` }}>Current ({m.colA})</th>,
-                          <th key={m.colA + "b"} style={{ ...sTh, color: C.pu }}>USOPTE ({m.colB})</th>,
-                          <th key={m.colA + "d"} style={{ ...sTh, color: C.am }}>Diff</th>,
-                          <th key={m.colA + "c"} style={{ ...sTh, color: C.tl }}>SK Comment</th>]
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {filtered.slice(0, 300).map((r, i) => (
-                        <tr key={i} style={{ background: r.status === "Mismatched" ? C.rdl : r.status === "Only in A" ? C.aml : r.status === "Only in B" ? C.pul : i % 2 ? C.bg : C.sf }}>
-                          <td style={sTd}><Badge s={r.status} /></td>
-                          {kMaps.map(m => <td key={m.colA} style={sTd}>{r.keyVals[m.colA] ?? ""}</td>)}
-                          {cMaps.map(m => {
-                            const d = r.details.find(x => x.colA === m.colA);
-                            const mis = d?.status === "Mismatched";
-                            const vA = d?.valA ?? (r.rowA?.[m.colA] ?? "");
-                            const vB = d?.valB ?? (r.rowB?.[m.colB] ?? "");
-                            const df = d?.diff || "";
-                            const cm = skComment(df, r.status);
-                            return [
-                              <td key={m.colA + "a"} style={{ ...sTd, color: C.bl, borderLeft: `2px solid ${C.bd}`, background: mis ? C.rdl : "transparent" }}>{vA || "\u2014"}</td>,
-                              <td key={m.colA + "b"} style={{ ...sTd, color: C.pu, background: mis ? C.rdl : "transparent" }}>{vB || "\u2014"}</td>,
-                              <td key={m.colA + "d"} style={{ ...sTd, color: mis ? C.rd : C.tl, fontWeight: mis ? 700 : 400 }}>{df || "\u2014"}</td>,
-                              <td key={m.colA + "c"} style={{ ...sTd, color: C.am, fontStyle: "italic", fontSize: 10 }}>{cm || "\u2014"}</td>,
-                            ];
-                          })}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                  {filtered.length === 0 && <div style={{ padding: 30, textAlign: "center", color: C.tl }}>No records match.</div>}
-                  {filtered.length > 300 && <div style={{ padding: 8, textAlign: "center", color: C.tl, fontSize: 10 }}>Showing 300 of {filtered.length}. Export for all.</div>}
-                </div>
-              </div>
-            )}
-
-            {/* ─── COMPARISON SHEET ─── */}
-            {tab === "sheet" && (() => {
-              const ls = sessions[sessions.length - 1];
-              if (!ls) return <div style={{ color: C.tl }}>No session data.</div>;
-              const scm = ls.mappings.filter(m => m.compare && !m.isKey && m.colA && m.colB);
-              const fr = ls.results.find(r => r.rowA)?.rowA || {};
-              const ac = Object.keys(fr);
-              const cs = new Set(scm.map(m => m.colA));
-              const sc = ac.filter(c => !cs.has(c));
-
-              return (
-                <div>
-                  <div style={{ background: C.bll, borderRadius: 9, padding: "10px 14px", marginBottom: 10, fontSize: 11, color: C.tm }}>
-                    2 rows per record: Row 1 = File A (Current), Row 2 = File B (USOPTE). Showing first 200 records.
-                  </div>
-                  <div style={sCard}>
-                    <div style={{ overflowX: "auto", maxHeight: 520, overflowY: "auto" }}>
-                      <table style={{ borderCollapse: "collapse", fontSize: 10 }}>
-                        <thead style={{ position: "sticky", top: 0, zIndex: 2 }}>
-                          <tr>
-                            <th style={{ ...sTh, background: C.hbg, color: "#fff" }}>Status</th>
-                            <th style={{ ...sTh, background: C.hbg, color: "#fff" }}>Source</th>
-                            <th style={{ ...sTh, background: C.hbg, color: "#fff" }}>Key</th>
-                            {sc.map(c => <th key={c} style={{ ...sTh, background: C.hbg, color: "#CBD5E1" }}>{c}</th>)}
-                            {scm.map(m => [
-                              <th key={m.colA + "c"} style={{ ...sTh, background: "#7F1D1D", color: "#FCA5A5", borderLeft: "2px solid #991B1B" }}>{m.colA}</th>,
-                              <th key={m.colA + "u"} style={{ ...sTh, background: "#7F1D1D", color: "#FCA5A5" }}>{m.colB} (USOPTE)</th>,
-                              <th key={m.colA + "d"} style={{ ...sTh, background: "#7F1D1D", color: "#FCA5A5" }}>Difference</th>,
-                              <th key={m.colA + "k"} style={{ ...sTh, background: "#7F1D1D", color: "#FCA5A5", borderRight: "2px solid #991B1B" }}>SK Comment</th>,
-                            ])}
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {ls.results.slice(0, 200).flatMap((r, ri) => {
-                            const km = ls.mappings.filter(m => m.isKey && m.colA && m.colB);
-                            const sm = ls.mappings.filter(m => m.compare && !m.isKey && m.colA && m.colB);
-                            const bm = Object.fromEntries(ls.mappings.filter(m => m.colA && m.colB).map(m => [m.colA, m.colB]));
-                            const key = km.map(m => r.keyVals[m.colA] ?? "").join("|");
-                            const isMis = r.status !== "Matched";
-                            const bgA = isMis ? "#FFF5F5" : ri % 2 === 0 ? C.sf : C.bg;
-                            const bgB = isMis ? "#FFF0F0" : ri % 2 === 0 ? "#F5F8FF" : "#EFF4FF";
-
-                            const rowA = (
-                              <tr key={ri + "a"} style={{ background: bgA }}>
-                                <td style={sTd}><Badge s={r.status} /></td>
-                                <td style={{ ...sTd, color: C.bl, fontWeight: 600 }}>{ls.fileAName}</td>
-                                <td style={{ ...sTd, color: C.tm }}>{key}</td>
-                                {sc.map(c => <td key={c} style={{ ...sTd, color: C.tm }}>{r.rowA ? (r.rowA[c] ?? "") : "\u2014"}</td>)}
-                                {scm.map(m => {
-                                  const f = sm.find(x => x.colA === m.colA);
-                                  const vA = f && r.rowA ? (r.rowA[f.colA] ?? "") : "";
-                                  const vB = f && r.rowB ? (r.rowB[f.colB] ?? "") : "";
-                                  const d = r.details?.find(x => x.colA === m.colA);
-                                  const df = d?.diff || "";
-                                  const mi = d?.status === "Mismatched";
-                                  const cm = skComment(df, r.status);
-                                  return [
-                                    <td key={m.colA + "c"} style={{ ...sTd, color: mi ? C.rd : C.bl, borderLeft: "2px solid #FECACA", fontWeight: mi ? 700 : 400, background: "#FFF8F8" }}>{vA || "\u2014"}</td>,
-                                    <td key={m.colA + "u"} style={{ ...sTd, color: C.tl, background: "#FFF8F8" }}>{"\u2014"}</td>,
-                                    <td key={m.colA + "d"} style={{ ...sTd, color: mi ? C.rd : C.tl, background: "#FFF8F8" }}>{mi ? df : "\u2014"}</td>,
-                                    <td key={m.colA + "k"} style={{ ...sTd, color: C.am, fontStyle: "italic", background: "#FFF8F8", borderRight: "2px solid #FECACA" }}>{cm || "\u2014"}</td>,
-                                  ];
-                                })}
-                              </tr>
-                            );
-
-                            const rowB = (
-                              <tr key={ri + "b"} style={{ background: bgB, borderBottom: `2px solid ${C.bd}` }}>
-                                <td style={{ ...sTd, color: C.tl }} />
-                                <td style={{ ...sTd, color: C.pu, fontWeight: 600 }}>{ls.fileBName}</td>
-                                <td style={{ ...sTd, color: C.tl }}>{key}</td>
-                                {sc.map(c => { const cb = bm[c] || c; return <td key={c} style={{ ...sTd, color: C.tl }}>{r.rowB ? (r.rowB[cb] ?? "") : "\u2014"}</td>; })}
-                                {scm.map(m => {
-                                  const f = sm.find(x => x.colA === m.colA);
-                                  const vB = f && r.rowB ? (r.rowB[f.colB] ?? "") : "";
-                                  const d = r.details?.find(x => x.colA === m.colA);
-                                  const mi = d?.status === "Mismatched";
-                                  return [
-                                    <td key={m.colA + "c"} style={{ ...sTd, color: C.tl, background: "#FFF8F8", borderLeft: "2px solid #FECACA" }}>{"\u2014"}</td>,
-                                    <td key={m.colA + "u"} style={{ ...sTd, color: mi ? C.pu : C.pu, fontWeight: mi ? 700 : 400, background: mi ? "#F5E8FF" : "#FFF8F8" }}>{vB || "\u2014"}</td>,
-                                    <td key={m.colA + "d"} style={{ ...sTd, color: C.tl, background: "#FFF8F8" }}>{"\u2014"}</td>,
-                                    <td key={m.colA + "k"} style={{ ...sTd, color: C.tl, background: "#FFF8F8", borderRight: "2px solid #FECACA" }}>{"\u2014"}</td>,
-                                  ];
-                                })}
-                              </tr>
-                            );
-                            return [rowA, rowB];
-                          })}
-                        </tbody>
-                      </table>
-                      {ls.results.length > 200 && <div style={{ padding: 10, textAlign: "center", color: C.tl, fontSize: 10 }}>Showing 200 of {ls.results.length}. Export for all.</div>}
-                    </div>
+                <div style={{paddingRight:10}}>
+                  <div style={{display:"inline-flex",alignItems:"center",padding:"4px 6px",borderRadius:8,background:"#F3F4F6",border:"1px solid #E5E7EB",maxWidth:"100%"}}>
+                    <select value={m.col2} onChange={e=>updateMapping(i,"col2",e.target.value)} style={{border:"none",background:"transparent",fontSize:13,fontWeight:500,color:C.text,outline:"none",width:"100%",cursor:"pointer",padding:"3px 4px"}}>
+                      <option value="">— None —</option>
+                      {data2.columns.map(c=><option key={c} value={c}>{c}</option>)}
+                    </select>
+                    <span style={{color:C.textLight,fontSize:10}}>✕ ▾</span>
                   </div>
                 </div>
-              );
-            })()}
+                <div style={{textAlign:"center"}}><div onClick={()=>updateMapping(i,"isKey",!m.isKey)} style={{width:22,height:22,borderRadius:"50%",border:`2px solid ${m.isKey?C.key:"#D1D5DB"}`,background:m.isKey?C.key:"transparent",display:"inline-flex",alignItems:"center",justifyContent:"center",cursor:"pointer"}}>{m.isKey&&<div style={{width:10,height:10,borderRadius:"50%",background:"#fff"}}/>}</div></div>
+                <div style={{textAlign:"center"}}><div onClick={()=>updateMapping(i,"compare",!m.compare)} style={{width:40,height:22,borderRadius:11,padding:2,cursor:"pointer",background:m.compare?C.primary:"#D1D5DB",display:"inline-flex",alignItems:"center",justifyContent:m.compare?"flex-end":"flex-start"}}><div style={{width:18,height:18,borderRadius:"50%",background:"#fff",boxShadow:"0 1px 3px rgba(0,0,0,0.18)"}}/></div></div>
+                <div style={{textAlign:"center"}}><div onClick={()=>updateMapping(i,"ignoreCase",!m.ignoreCase)} style={{width:22,height:22,borderRadius:"50%",border:`2px solid ${m.ignoreCase?C.blue:"#D1D5DB"}`,background:m.ignoreCase?C.blue:"transparent",display:"inline-flex",alignItems:"center",justifyContent:"center",cursor:"pointer"}}>{m.ignoreCase&&<div style={{width:10,height:10,borderRadius:"50%",background:"#fff"}}/>}</div></div>
+                <div style={{textAlign:"center"}}><input type="text" value={m.tolerance} onChange={e=>updateMapping(i,"tolerance",e.target.value)} placeholder="0" style={{width:72,padding:"5px 8px",borderRadius:6,border:`1px solid ${C.border}`,fontSize:12,textAlign:"center",background:"#fff",outline:"none"}}/></div>
+              </div>
+            ))}
           </div>
-        )}
+          <div style={{display:"flex",alignItems:"center",gap:28,padding:"12px 20px",background:"#F9FAFB",borderTop:`1px solid ${C.border}`,fontSize:13}}>
+            <span>Total: <strong style={{color:C.blue,fontSize:15}}>{mappings.length}</strong></span>
+            <span>Keys: <strong style={{color:keyCount>0?C.key:C.red,fontSize:15}}>{keyCount}</strong></span>
+            <span>Compare: <strong style={{color:C.primary,fontSize:15}}>{compareCount}</strong></span>
+            {keyCount===0&&<span style={{color:C.red,fontSize:12,fontWeight:600,marginLeft:"auto"}}>⚠ Select at least one key column</span>}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
+  // ═══ RESULTS ═══
+  const tabs=[{id:"overview",label:"Overview"},{id:"mismatches",label:`Mismatches (${fmt(results.mismatched.length)})`},{id:"only1",label:`Only DS1 (${fmt(results.onlyIn1.length)})`},{id:"only2",label:`Only DS2 (${fmt(results.onlyIn2.length)})`},{id:"categories",label:"By Category"},{id:"matched",label:`Matched (${fmt(results.matched.length)})`}];
+  const kpis=[{label:"Exact Matches",value:results.matched.length,color:C.green,bg:C.greenBg},{label:"Value Mismatches",value:results.mismatched.length,color:C.red,bg:C.redBg},{label:"Only in Dataset 1",value:results.onlyIn1.length,color:C.orange,bg:C.orangeBg},{label:"Only in Dataset 2",value:results.onlyIn2.length,color:C.blue,bg:C.blueBg},{label:"Match Rate",value:pct(results.matched.length,total),color:C.purple,bg:C.purpleBg,isText:true}];
+  const topCat=Object.entries(results.catStats).sort((a,b)=>b[1].mismatched-a[1].mismatched)[0];
+  const keyLabels=results.keyMappings.map(m=>m.col1);const valLabels=results.compareMappings.map(m=>m.col1);
+
+  return (
+    <div style={{minHeight:"100vh",background:C.bg,fontFamily:"'Segoe UI',-apple-system,sans-serif",color:C.text}}>
+      <div style={{maxWidth:1400,margin:"0 auto",padding:"24px 24px"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20,flexWrap:"wrap",gap:12}}>
+          <div style={{display:"flex",alignItems:"center",gap:10}}>
+            <div style={{width:34,height:34,borderRadius:8,background:`linear-gradient(135deg,${C.primary},#15A07A)`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,fontWeight:800,color:"#fff"}}>IQ</div>
+            <span style={{fontSize:20,fontWeight:700}}>CompareIQ Pro</span>
+            <span style={{fontSize:12,color:C.textDim,marginLeft:8}}>Key: <strong style={{color:C.key}}>{keyLabels.join(" + ")}</strong></span>
+            {demoMode&&<span style={{padding:"3px 10px",borderRadius:12,background:"#DBEAFE",color:"#1D4ED8",fontSize:11,fontWeight:700}}>DEMO</span>}
+          </div>
+          <div style={{display:"flex",gap:10}}>
+            <button onClick={()=>{setStep("config");setResults(null);}} style={{padding:"8px 18px",borderRadius:8,border:`1px solid ${C.border}`,background:"#fff",fontWeight:600,fontSize:13,cursor:"pointer",color:C.text}}>← Reconfigure</button>
+            <button onClick={()=>exportExcel(results,mappings,file1?.name||"DS1",file2?.name||"DS2")} style={{padding:"8px 20px",borderRadius:8,border:"none",background:C.primary,color:"#fff",fontWeight:600,fontSize:13,cursor:"pointer",display:"flex",alignItems:"center",gap:6}}><Ico.Download/> Export Excel (CSVs)</button>
+          </div>
+        </div>
+
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(185px,1fr))",gap:14,marginBottom:22}}>
+          {kpis.map((k,i)=>(<div key={i} style={{padding:"20px 18px",borderRadius:12,background:k.bg,border:`1px solid ${k.color}22`,position:"relative"}}><div style={{position:"absolute",top:0,left:0,right:0,height:3,background:k.color,borderRadius:"12px 12px 0 0"}}/><div style={{fontSize:11,color:C.textDim,textTransform:"uppercase",letterSpacing:0.8,marginBottom:6}}>{k.label}</div><div style={{fontSize:26,fontWeight:700,color:k.color,fontFamily:"monospace"}}>{k.isText?k.value:fmt(k.value)}</div></div>))}
+        </div>
+
+        <div style={{display:"flex",gap:4,marginBottom:18,background:"#fff",borderRadius:10,padding:4,width:"fit-content",border:`1px solid ${C.border}`,flexWrap:"wrap"}}>
+          {tabs.map(t=><button key={t.id} onClick={()=>setActiveTab(t.id)} style={{padding:"9px 16px",borderRadius:8,border:"none",fontWeight:500,fontSize:13,cursor:"pointer",color:activeTab===t.id?"#fff":C.textDim,background:activeTab===t.id?C.primary:"transparent"}}>{t.label}</button>)}
+        </div>
+
+        {activeTab==="overview"&&(<div>
+          <div style={{background:"#fff",border:`1px solid ${C.border}`,borderRadius:12,padding:22,marginBottom:14}}>
+            <div style={{fontSize:14,fontWeight:600,marginBottom:14}}>Comparison Breakdown</div>
+            <div style={{display:"flex",height:28,borderRadius:6,overflow:"hidden",marginBottom:12}}>
+              {[{v:results.matched.length,c:C.green},{v:results.mismatched.length,c:C.red},{v:results.onlyIn1.length,c:C.orange},{v:results.onlyIn2.length,c:C.blue}].map((s,i)=>{const w=(s.v/total)*100;return w>0?<div key={i} style={{width:`${Math.max(w,1.5)}%`,background:s.c}}/>:null;})}
+            </div>
+            <div style={{display:"flex",gap:24,flexWrap:"wrap"}}>{[{c:C.green,l:"Matched",v:results.matched.length},{c:C.red,l:"Mismatched",v:results.mismatched.length},{c:C.orange,l:"Only DS1",v:results.onlyIn1.length},{c:C.blue,l:"Only DS2",v:results.onlyIn2.length}].map((x,i)=>(<div key={i} style={{display:"flex",alignItems:"center",gap:6,fontSize:13,color:C.textDim}}><div style={{width:10,height:10,borderRadius:3,background:x.c}}/>{x.l}: <strong style={{color:C.text}}>{fmt(x.v)}</strong></div>))}</div>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,marginBottom:14}}>
+            <div style={{background:"#fff",border:`1px solid ${C.border}`,borderRadius:12,padding:20}}>
+              <div style={{fontSize:13,fontWeight:600,marginBottom:10,color:C.primary}}>Configuration</div>
+              <div style={{fontSize:12,color:C.textDim,marginBottom:5}}>Key: <strong style={{color:C.key}}>{keyLabels.join(" + ")}</strong></div>
+              <div style={{fontSize:12,color:C.textDim,marginBottom:5}}>Values: <strong style={{color:C.text}}>{valLabels.join(", ")||"(all compare)"}</strong></div>
+              <div style={{fontSize:12,color:C.textDim}}>DS1: {fmt(data1.data.length)} rows | DS2: {fmt(data2.data.length)} rows</div>
+            </div>
+            {topCat&&topCat[1].mismatched>0&&(<div style={{background:"#fff",border:`1px solid ${C.red}33`,borderRadius:12,padding:20}}>
+              <div style={{fontSize:13,fontWeight:600,marginBottom:6,color:C.red}}>Top Problem Area</div>
+              <div style={{fontSize:17,fontWeight:700,color:C.red}}>{topCat[0]}</div>
+              <div style={{fontSize:12,color:C.textDim,marginTop:4}}>{fmt(topCat[1].mismatched)} of {fmt(results.mismatched.length)} mismatches</div>
+            </div>)}
+          </div>
+          <div style={{background:"#fff",border:`1px solid ${C.border}`,borderRadius:12,overflow:"hidden"}}>
+            <table style={{width:"100%",borderCollapse:"collapse"}}>
+              <thead><tr>{[results.catCol,"Matched","Mismatched","Only DS1","Only DS2","Match Rate"].map(h=><th key={h} style={{padding:"10px 14px",textAlign:"left",fontSize:11,fontWeight:600,textTransform:"uppercase",color:C.textDim,borderBottom:`2px solid ${C.border}`,background:"#F9FAFB"}}>{h}</th>)}</tr></thead>
+              <tbody>{Object.entries(results.catStats).sort((a,b)=>b[1].mismatched-a[1].mismatched).map(([cat,s])=>{const ct=s.matched+s.mismatched+s.onlyIn1+s.onlyIn2;const r=ct>0?(s.matched/ct)*100:100;return(<tr key={cat}><td style={{padding:"9px 14px",borderBottom:`1px solid ${C.borderLight}`,fontSize:13,fontWeight:500}}>{cat}</td><td style={{padding:"9px 14px",borderBottom:`1px solid ${C.borderLight}`,fontSize:13,fontFamily:"monospace",color:C.green}}>{fmt(s.matched)}</td><td style={{padding:"9px 14px",borderBottom:`1px solid ${C.borderLight}`,fontSize:13,fontFamily:"monospace",color:s.mismatched>0?C.red:C.textLight,fontWeight:s.mismatched>0?700:400}}>{fmt(s.mismatched)}</td><td style={{padding:"9px 14px",borderBottom:`1px solid ${C.borderLight}`,fontSize:13,fontFamily:"monospace",color:s.onlyIn1>0?C.orange:C.textLight}}>{fmt(s.onlyIn1)}</td><td style={{padding:"9px 14px",borderBottom:`1px solid ${C.borderLight}`,fontSize:13,fontFamily:"monospace",color:s.onlyIn2>0?C.blue:C.textLight}}>{fmt(s.onlyIn2)}</td><td style={{padding:"9px 14px",borderBottom:`1px solid ${C.borderLight}`}}><div style={{display:"flex",alignItems:"center",gap:8}}><div style={{flex:1,height:6,background:"#F3F4F6",borderRadius:3,overflow:"hidden"}}><div style={{width:`${r}%`,height:"100%",borderRadius:3,background:r===100?C.green:r>95?C.orange:C.red}}/></div><span style={{fontSize:12,color:C.textDim,minWidth:42,textAlign:"right"}}>{r.toFixed(1)}%</span></div></td></tr>);})}</tbody>
+            </table>
+          </div>
+        </div>)}
+
+        {activeTab==="mismatches"&&(<div>
+          <div style={{display:"flex",gap:12,alignItems:"center",marginBottom:14}}>
+            <div style={{position:"relative",flex:1,maxWidth:360}}><div style={{position:"absolute",left:11,top:"50%",transform:"translateY(-50%)",color:C.textLight}}><Ico.Search/></div><input placeholder="Search..." value={searchTerm} onChange={e=>setSearchTerm(e.target.value)} style={{width:"100%",padding:"9px 14px 9px 36px",borderRadius:8,border:`1px solid ${C.border}`,background:"#fff",fontSize:13,outline:"none",color:C.text}}/></div>
+            <span style={{fontSize:12,color:C.textDim}}>{fmt(filteredMismatches.length)} mismatches</span>
+          </div>
+          <div style={{background:"#fff",border:`1px solid ${C.border}`,borderRadius:12,overflow:"hidden",maxHeight:500,overflowY:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse"}}>
+              <thead><tr>{keyLabels.map(k=><th key={k} style={{padding:"10px 12px",textAlign:"left",fontSize:11,fontWeight:600,textTransform:"uppercase",color:C.textDim,borderBottom:`2px solid ${C.border}`,background:"#F9FAFB",position:"sticky",top:0,zIndex:2}}>{k}</th>)}{valLabels.map(v=><th key={v} colSpan={3} onClick={()=>setSortConfig(p=>({key:v,dir:p.key===v&&p.dir==="asc"?"desc":"asc"}))} style={{padding:"10px 8px",textAlign:"center",fontSize:11,fontWeight:600,textTransform:"uppercase",color:C.textDim,borderBottom:`2px solid ${C.border}`,background:"#F9FAFB",borderLeft:`2px solid ${C.border}`,cursor:"pointer",position:"sticky",top:0,zIndex:2}}>{v} {sortConfig.key===v?(sortConfig.dir==="asc"?"↑":"↓"):""}</th>)}</tr>
+                <tr>{keyLabels.map(k=><th key={`s${k}`} style={{padding:"3px 12px",fontSize:9,fontWeight:600,color:C.textLight,background:"#F9FAFB",borderBottom:`1px solid ${C.border}`,position:"sticky",top:34,zIndex:2}}/>)}{valLabels.flatMap(v=>["DS1","DS2","DIFF"].map((l,li)=><th key={`${v}${l}`} style={{padding:"3px 8px",fontSize:9,fontWeight:600,color:C.textLight,background:"#F9FAFB",borderBottom:`1px solid ${C.border}`,borderLeft:li===0?`2px solid ${C.border}`:"none",position:"sticky",top:34,zIndex:2}}>{l}</th>))}</tr>
+              </thead>
+              <tbody>{filteredMismatches.slice(0,500).map((m,i)=>(<tr key={i} style={{background:i%2===0?"#fff":"#FAFBFC"}}>{results.keyMappings.map(km=><td key={km.col1} style={{padding:"8px 12px",borderBottom:`1px solid ${C.borderLight}`,fontSize:13}}>{m.row1[km.col1]}</td>)}{results.compareMappings.map(cm=>{const d=m.diffs[cm.col1];const v1=d?d.v1:cleanNum(m.row1[cm.col1]);const v2=d?d.v2:cleanNum(m.row2[cm.col2]);const diff=d?.diff;const hasDiff=d!=null;const isNum=typeof v1==="number";return[<td key={`${cm.col1}-1`} style={{padding:"8px 8px",borderBottom:`1px solid ${C.borderLight}`,borderLeft:`2px solid ${C.borderLight}`,fontSize:12,fontFamily:"monospace"}}>{isNum?v1.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}):v1}</td>,<td key={`${cm.col1}-2`} style={{padding:"8px 8px",borderBottom:`1px solid ${C.borderLight}`,fontSize:12,fontFamily:"monospace"}}>{isNum?v2.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}):v2}</td>,<td key={`${cm.col1}-d`} style={{padding:"8px 8px",borderBottom:`1px solid ${C.borderLight}`,fontSize:12,fontFamily:"monospace",color:hasDiff?(diff>0?C.green:C.red):C.textLight,fontWeight:hasDiff?700:400,background:hasDiff?(diff>0?"#F0FDF4":"#FEF2F2"):"transparent"}}>{diff!==null&&diff!==undefined?(diff>0?"+":"")+diff.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}):hasDiff?"≠":"—"}</td>];})}</tr>))}</tbody>
+            </table>
+          </div>
+        </div>)}
+
+        {(activeTab==="only1"||activeTab==="only2")&&(()=>{const items=activeTab==="only1"?results.onlyIn1:results.onlyIn2;const label=activeTab==="only1"?"Dataset 1":"Dataset 2";const side=activeTab==="only1"?"col1":"col2";const allM=results.allActiveMappings;return(<div><div style={{fontSize:13,color:C.textDim,marginBottom:12}}>{fmt(items.length)} records only in {label}</div><div style={{background:"#fff",border:`1px solid ${C.border}`,borderRadius:12,overflow:"hidden",maxHeight:500,overflowY:"auto"}}><table style={{width:"100%",borderCollapse:"collapse"}}><thead><tr>{allM.map(m=><th key={m[side]} style={{padding:"10px 14px",textAlign:"left",fontSize:11,fontWeight:600,textTransform:"uppercase",color:C.textDim,borderBottom:`2px solid ${C.border}`,background:"#F9FAFB",position:"sticky",top:0}}>{m[side]}</th>)}</tr></thead><tbody>{items.slice(0,500).map((m,i)=>(<tr key={i} style={{background:i%2===0?"#fff":"#FAFBFC"}}>{allM.map(cm=><td key={cm[side]} style={{padding:"9px 14px",borderBottom:`1px solid ${C.borderLight}`,fontSize:13,fontFamily:"monospace"}}>{m.row[cm[side]]}</td>)}</tr>))}{items.length===0&&<tr><td colSpan={allM.length} style={{padding:48,textAlign:"center",color:C.textLight}}>No orphan records</td></tr>}</tbody></table></div></div>);})()}
+
+        {activeTab==="categories"&&(<div style={{display:"grid",gap:12}}>{Object.entries(results.catStats).sort((a,b)=>b[1].mismatched-a[1].mismatched).map(([cat,s])=>{const ct=s.matched+s.mismatched+s.onlyIn1+s.onlyIn2;const r=ct>0?(s.matched/ct)*100:100;return(<div key={cat} style={{background:"#fff",border:`1px solid ${C.border}`,borderRadius:12,padding:18}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}><span style={{fontSize:14,fontWeight:600}}>{cat}</span><span style={{padding:"3px 12px",borderRadius:20,fontSize:11,fontWeight:600,background:r===100?C.greenBg:r>95?C.orangeBg:C.redBg,color:r===100?C.green:r>95?C.orange:C.red}}>{r.toFixed(1)}%</span></div><div style={{display:"flex",height:8,borderRadius:4,overflow:"hidden",marginBottom:10}}><div style={{width:`${(s.matched/ct)*100}%`,background:C.green}}/><div style={{width:`${(s.mismatched/ct)*100}%`,background:C.red}}/><div style={{width:`${(s.onlyIn1/ct)*100}%`,background:C.orange}}/><div style={{width:`${(s.onlyIn2/ct)*100}%`,background:C.blue}}/></div><div style={{display:"flex",gap:20,fontSize:12,color:C.textDim}}><span>Matched: <strong style={{color:C.green}}>{fmt(s.matched)}</strong></span><span>Mismatched: <strong style={{color:C.red}}>{fmt(s.mismatched)}</strong></span><span>Only DS1: <strong style={{color:C.orange}}>{fmt(s.onlyIn1)}</strong></span><span>Only DS2: <strong style={{color:C.blue}}>{fmt(s.onlyIn2)}</strong></span></div></div>);})}</div>)}
+
+        {activeTab==="matched"&&(<div><div style={{fontSize:13,color:C.textDim,marginBottom:12}}>Showing {fmt(Math.min(results.matched.length,200))} of {fmt(results.matched.length)}</div><div style={{background:"#fff",border:`1px solid ${C.border}`,borderRadius:12,overflow:"hidden",maxHeight:500,overflowY:"auto"}}><table style={{width:"100%",borderCollapse:"collapse"}}><thead><tr>{results.allActiveMappings.map(m=><th key={m.col1} style={{padding:"10px 14px",textAlign:"left",fontSize:11,fontWeight:600,textTransform:"uppercase",color:C.textDim,borderBottom:`2px solid ${C.border}`,background:"#F9FAFB",position:"sticky",top:0}}>{m.col1}</th>)}</tr></thead><tbody>{results.matched.slice(0,200).map((m,i)=>(<tr key={i} style={{background:i%2===0?"#fff":"#FAFBFC"}}>{results.allActiveMappings.map(cm=><td key={cm.col1} style={{padding:"9px 14px",borderBottom:`1px solid ${C.borderLight}`,fontSize:13,fontFamily:"monospace"}}>{m.row1[cm.col1]}</td>)}</tr>))}</tbody></table></div></div>)}
+
+        <div style={{textAlign:"center",padding:"28px 0 12px",fontSize:11,color:C.textLight}}>CompareIQ Pro — Precision Data Comparison Engine</div>
       </div>
     </div>
   );
